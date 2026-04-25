@@ -29,13 +29,17 @@
             "description": "City used when fetching prayer times from Aladhan API.",
             "default": "London"
         },
-        "method": {
-            "type": "int",
-            "name": "Calculation Method",
-            "description": "Aladhan calculation method ID. if you don't know what this is, leave it as 2!",
-            "default": 2,
-            "min": 0,
-            "max": 20
+        "auto-pause-on-prayer": {
+            "type": "bool",
+            "name": "Auto Pause On Prayer",
+            "description": "Automatically pause the level when prayer time starts.",
+            "default": false
+        },
+        "remind-one-minute-before": {
+            "type": "bool",
+            "name": "1 Minute Reminder",
+            "description": "Show a reminder notification 1 minute before each prayer time.",
+            "default": false
         },
         "geoip-actions": {
             "type": "button",

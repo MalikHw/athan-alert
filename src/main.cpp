@@ -98,7 +98,22 @@ namespace {
             for (auto const* prayerName : kPrayerNames) {
                 auto it = m_prayerMinutes.find(prayerName);
                 if (it == m_prayerMinutes.end()) continue;
-                if (it->second != currentMinute) continue;
+                auto prayerMinute = it->second;
+
+                if (Mod::get()->getSettingValue<bool>("remind-one-minute-before")) {
+                    if (prayerMinute - 1 == currentMinute) {
+                        auto preKey = fmt::format("{}-{}-pre", date, prayerName);
+                        if (m_notifiedKeys.insert(preKey).second) {
+                            Notification::create(
+                                fmt::format("{} starts in 1 minute", prayerName),
+                                NotificationIcon::Info,
+                                2.5f
+                            )->show();
+                        }
+                    }
+                }
+
+                if (prayerMinute != currentMinute) continue;
 
                 auto notifyKey = fmt::format("{}-{}", date, prayerName);
                 if (!m_notifiedKeys.insert(notifyKey).second) continue;
@@ -108,6 +123,10 @@ namespace {
                     NotificationIcon::Info,
                     3.f
                 )->show();
+
+                if (Mod::get()->getSettingValue<bool>("auto-pause-on-prayer") && PlayLayer::get() != nullptr) {
+                    CCDirector::sharedDirector()->pause();
+                }
             }
         }
 
@@ -127,7 +146,7 @@ namespace {
 
             auto country = Mod::get()->getSettingValue<std::string>("country");
             auto city = Mod::get()->getSettingValue<std::string>("city");
-            auto method = static_cast<int>(Mod::get()->getSettingValue<int64_t>("method"));
+            constexpr int method = 2;
 
             std::thread([this, country = std::move(country), city = std::move(city), method]() {
                 auto request = web::WebRequest();
@@ -302,9 +321,6 @@ $on_mod(Loaded) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
     })->leak();
     listenForSettingChanges<std::string_view>("city", [](std::string_view) {
-        if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    })->leak();
-    listenForSettingChanges<int64_t>("method", [](int64_t) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
     })->leak();
 }
