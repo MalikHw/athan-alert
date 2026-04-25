@@ -7,21 +7,43 @@
         "ios": "2.2081"
     },
     "version": "1.0.0",
-    "id": "malikhw47.smth",
-    "name": "nam",
+    "id": "malikhw47.athan-alert",
+    "name": "Athan Alert",
     "developer": "MalikHw47",
-    "description": "desc.",
-    "tags": ["yes", "yeah"],
+    "description": "Shows in-game notifications at Fajr, Dhuhr, Asr, Maghrib, and Isha prayer times.",
+    "tags": ["utility", "online"],
     "links": {
-        "source": "https://github.com/MalikHw/geode-template",
+        "source": "https://github.com/MalikHw/athan-alert",
         "community": "https://discord.gg/G9bZ92eg2n"
     },
-    "settings": {},
-    "suggested": [
-        {
-            "id": "something",
-            "importance": "recommended",
-            "reason": "n"
+    "settings": {
+        "country": {
+            "type": "string",
+            "name": "Country",
+            "description": "Country used when fetching prayer times from Aladhan API.",
+            "default": "United Kingdom"
+        },
+        "city": {
+            "type": "string",
+            "name": "City",
+            "description": "City used when fetching prayer times from Aladhan API.",
+            "default": "London"
+        },
+        "method": {
+            "type": "int",
+            "name": "Calculation Method",
+            "description": "Aladhan calculation method ID. if you don't know what this is, leave it as 2!",
+            "default": 2,
+            "min": 0,
+            "max": 20
+        },
+        "geoip-actions": {
+            "type": "button",
+            "name": "Location Detection",
+            "description": "Detect location by GeoIP and auto-fill Country/City.",
+            "buttons": {
+                "detect-location": "Detect Country/City via GeoIP"
+            }
         }
-    ]
+    }
 }
