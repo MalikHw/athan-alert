@@ -235,6 +235,31 @@ namespace {
                 });
             }).detach();
         }
+
+        void showTestNotification() {
+            queueInMainThread([]() {
+                Notification::create("Test: Athan notification works", NotificationIcon::Info, 2.5f)->show();
+            });
+        }
+
+        void simulatePrayerNow() {
+            auto nowTs = std::time(nullptr);
+            std::tm localTm {};
+#ifdef GEODE_IS_WINDOWS
+            localtime_s(&localTm, &nowTs);
+#else
+            localtime_r(&nowTs, &localTm);
+#endif
+            auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
+            auto date = currentDateKey();
+            auto prayerName = std::string("Fajr");
+
+            m_prayerMinutes[prayerName] = currentMinute;
+            m_notifiedKeys.erase(fmt::format("{}-{}", date, prayerName));
+
+            Notification::create("Simulating Fajr at current time", NotificationIcon::Info, 2.f)->show();
+            this->tick(0.f);
+        }
     };
 
     AthanRuntime* g_runtime = nullptr;
@@ -259,6 +284,18 @@ $on_mod(Loaded) {
     ButtonSettingPressedEventV3(Mod::get(), "geoip-actions").listen([](std::string_view buttonKey) {
         if (buttonKey != "detect-location" || !g_runtime) return;
         g_runtime->detectLocationByGeoIpAsync();
+    }).leak();
+    ButtonSettingPressedEventV3(Mod::get(), "debug-actions").listen([](std::string_view buttonKey) {
+        if (!g_runtime) return;
+
+        if (buttonKey == "test-notification") {
+            g_runtime->showTestNotification();
+            return;
+        }
+        if (buttonKey == "simulate-prayer-now") {
+            g_runtime->simulatePrayerNow();
+            return;
+        }
     }).leak();
 
     listenForSettingChanges<std::string_view>("country", [](std::string_view) {

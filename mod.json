@@ -44,6 +44,15 @@
             "buttons": {
                 "detect-location": "Detect Country/City via GeoIP"
             }
+        },
+        "debug-actions": {
+            "type": "button",
+            "name": "Debug Test",
+            "description": "Quick test tools for notifications.",
+            "buttons": {
+                "test-notification": "Show Test Notification",
+                "simulate-prayer-now": "Simulate Prayer Time Now"
+            }
         }
     }
 }
