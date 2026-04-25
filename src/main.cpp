@@ -1,5 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/loader/SettingV3.hpp>
+#include <Geode/modify/MenuLayer.hpp>
+#include <Geode/modify/PlayLayer.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <Geode/utils/web.hpp>
 
@@ -261,13 +263,13 @@ $on_mod(Loaded) {
 
     listenForSettingChanges<std::string_view>("country", [](std::string_view) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    }).leak();
+    })->leak();
     listenForSettingChanges<std::string_view>("city", [](std::string_view) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    }).leak();
+    })->leak();
     listenForSettingChanges<int64_t>("method", [](int64_t) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    }).leak();
+    })->leak();
 }
 
 class $modify(AthanMenuLayerHook, MenuLayer) {
