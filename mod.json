@@ -16,6 +16,10 @@
         "source": "https://github.com/MalikHw/athan-alert",
         "community": "https://discord.gg/G9bZ92eg2n"
     },
+    "resources": {
+        "files": ["resources/default-adhan.mp3"],
+        "sprites": ["resources/button.png"]
+    },
     "settings": {
         "country": {
             "type": "string",
@@ -40,6 +44,21 @@
             "name": "1 Minute Reminder",
             "description": "Show a reminder notification 1 minute before each prayer time.",
             "default": false
+        },
+        "adhan-mp3": {
+            "type": "file",
+            "name": "Adhan MP3",
+            "description": "MP3 played on prayer alert. Leave as default to use bundled adhan.",
+            "default": "{mod_resources_dir}/default-adhan.mp3",
+            "control": {
+                "dialog": "open",
+                "filters": [
+                    {
+                        "files": ["*.mp3"],
+                        "description": "MP3 Audio Files"
+                    }
+                ]
+            }
         },
         "geoip-actions": {
             "type": "button",
