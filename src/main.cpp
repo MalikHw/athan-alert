@@ -22,11 +22,10 @@ namespace web = geode::utils::web;
 
 namespace {
     // We use one date key so "already notified" tracking resets cleanly each new day.
-    static std::string currentDateKey() {
+    static std::string get_now_time_string() {
         auto now = std::time(nullptr);
         std::tm localTm {};
 #ifdef GEODE_IS_WINDOWS
-        // Windows uses localtime_s instead of localtime_r for thread-safe local time.
         localtime_s(&localTm, &now);
 #else
         localtime_r(&now, &localTm);
@@ -36,7 +35,7 @@ namespace {
         return buf;
     }
 
-    // API time strings may include suffixes like "(BST)", so we extract the first HH:MM.
+    // parsing is a bitch
     static std::optional<int> parseMinuteOfDay(std::string value) {
         auto firstDigit = value.find_first_of("0123456789");
         if (firstDigit == std::string::npos) return std::nullopt;
@@ -57,7 +56,7 @@ namespace {
         return hour * 60 + minute;
     }
 
-    static std::string formatMinuteOfDay(int minuteOfDay) {
+    static std::string format_time(int minuteOfDay) {
         auto hour = minuteOfDay / 60;
         auto minute = minuteOfDay % 60;
         auto period = hour >= 12 ? "PM" : "AM";
@@ -68,19 +67,19 @@ namespace {
 
     class AthanRuntime : public CCNode {
     protected:
-        std::unordered_map<std::string, int> m_prayerMinutes;
-        std::unordered_set<std::string> m_notifiedKeys;
-        std::atomic<bool> m_fetchingPrayerTimes = false;
-        std::atomic<bool> m_fetchingGeoIp = false;
-        std::time_t m_lastFetchTs = 0;
-        std::string m_lastFetchDate;
-        bool m_skipNextPrayerAlert = false;
+        std::unordered_map<std::string, int> pray_times;
+        std::unordered_set<std::string> done_notifs;
+        bool is_fetching = false;
+        bool fetchingGeo = false;
+        std::time_t last_time = 0;
+        std::string lastDate;
+        bool skip_it = false;
 
         static constexpr const char* kPrayerNames[5] = {
             "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"
         };
 
-        // Poll every 20 seconds to keep alerts lightweight but responsive.
+        // tick every 20s
         bool init() override {
             if (!CCNode::init()) return false;
 
@@ -90,19 +89,19 @@ namespace {
         }
 
         void tick(float) {
-            auto date = currentDateKey();
+            auto date = get_now_time_string();
             auto nowTs = std::time(nullptr);
 
-            if (date != m_lastFetchDate && !m_fetchingPrayerTimes.load()) {
-                m_notifiedKeys.clear();
+            if (date != lastDate && !is_fetching) {
+                done_notifs.clear();
                 this->fetchPrayerTimesAsync();
             }
 
-            if ((nowTs - m_lastFetchTs) > 1800 && !m_fetchingPrayerTimes.load()) {
+            if ((nowTs - last_time) > 1800 && !is_fetching) {
                 this->fetchPrayerTimesAsync();
             }
 
-            if (m_prayerMinutes.empty()) return;
+            if (pray_times.empty()) return;
 
             std::tm localTm {};
 #ifdef GEODE_IS_WINDOWS
@@ -113,14 +112,14 @@ namespace {
             auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
 
             for (auto const* prayerName : kPrayerNames) {
-                auto it = m_prayerMinutes.find(prayerName);
-                if (it == m_prayerMinutes.end()) continue;
+                auto it = pray_times.find(prayerName);
+                if (it == pray_times.end()) continue;
                 auto prayerMinute = it->second;
 
                 if (Mod::get()->getSettingValue<bool>("remind-one-minute-before")) {
                     if (prayerMinute - 1 == currentMinute) {
                         auto preKey = fmt::format("{}-{}-pre", date, prayerName);
-                        if (m_notifiedKeys.insert(preKey).second) {
+                        if (done_notifs.insert(preKey).second) {
                             Notification::create(
                                 fmt::format("{} starts in 1 minute", prayerName),
                                 NotificationIcon::Info,
@@ -133,10 +132,10 @@ namespace {
                 if (prayerMinute != currentMinute) continue;
 
                 auto notifyKey = fmt::format("{}-{}", date, prayerName);
-                if (!m_notifiedKeys.insert(notifyKey).second) continue;
+                if (!done_notifs.insert(notifyKey).second) continue;
 
-                if (m_skipNextPrayerAlert) {
-                    m_skipNextPrayerAlert = false;
+                if (skip_it) {
+                    skip_it = false;
                     Notification::create(
                         fmt::format("Skipped {} alert for this session", prayerName),
                         NotificationIcon::Info,
@@ -160,7 +159,6 @@ namespace {
         }
 
     public:
-        // Keep manual create() to match Geode CCNode patterns.
         static AthanRuntime* create() {
             auto ret = new AthanRuntime();
             if (ret && ret->init()) {
@@ -171,9 +169,10 @@ namespace {
             return nullptr;
         }
 
-        // Fetch latest times from Aladhan API and cache them in minutes-of-day.
+        // fetch shit from api
         void fetchPrayerTimesAsync() {
-            if (m_fetchingPrayerTimes.exchange(true)) return;
+            if (is_fetching) return;
+            is_fetching = true;
 
             auto country = Mod::get()->getSettingValue<std::string>("country");
             auto city = Mod::get()->getSettingValue<std::string>("city");
@@ -190,14 +189,14 @@ namespace {
                 auto response = request.getSync("https://api.aladhan.com/v1/timingsByCity");
                 if (!response.ok()) {
                     log::warn("Athan fetch failed: HTTP {} ({})", response.code(), response.errorMessage());
-                    m_fetchingPrayerTimes.store(false);
+                    is_fetching = false;
                     return;
                 }
 
                 auto jsonRes = response.json();
                 if (!jsonRes) {
                     log::warn("Athan fetch JSON parse failed");
-                    m_fetchingPrayerTimes.store(false);
+                    is_fetching = false;
                     return;
                 }
 
@@ -214,25 +213,26 @@ namespace {
 
                 if (parsed.empty()) {
                     log::warn("Athan fetch succeeded but no prayer times were parsed");
-                    m_fetchingPrayerTimes.store(false);
+                    is_fetching = false;
                     return;
                 }
 
                 queueInMainThread([this, parsed = std::move(parsed)]() mutable {
-                    m_prayerMinutes = std::move(parsed);
-                    m_lastFetchTs = std::time(nullptr);
-                    m_lastFetchDate = currentDateKey();
-                    m_notifiedKeys.clear();
-                    m_fetchingPrayerTimes.store(false);
+                    pray_times = std::move(parsed);
+                    last_time = std::time(nullptr);
+                    lastDate = get_now_time_string();
+                    done_notifs.clear();
+                    is_fetching = false;
 
                     Notification::create("Athan times updated", NotificationIcon::Info, 1.5f)->show();
                 });
             }).detach();
         }
 
-        // Optional helper so users can auto-fill city/country quickly.
+        // geoip shit
         void detectLocationByGeoIpAsync() {
-            if (m_fetchingGeoIp.exchange(true)) return;
+            if (fetchingGeo) return;
+            fetchingGeo = true;
 
             std::thread([this]() {
                 auto request = web::WebRequest();
@@ -242,7 +242,7 @@ namespace {
                 auto response = request.getSync("http://ip-api.com/json");
                 if (!response.ok()) {
                     queueInMainThread([this, code = response.code()]() {
-                        m_fetchingGeoIp.store(false);
+                        fetchingGeo = false;
                         Notification::create(
                             fmt::format("GeoIP request failed (HTTP {})", code),
                             NotificationIcon::Error,
@@ -255,7 +255,7 @@ namespace {
                 auto jsonRes = response.json();
                 if (!jsonRes) {
                     queueInMainThread([this]() {
-                        m_fetchingGeoIp.store(false);
+                        fetchingGeo = false;
                         Notification::create("GeoIP JSON parse failed", NotificationIcon::Error, 2.f)->show();
                     });
                     return;
@@ -267,7 +267,7 @@ namespace {
                 auto city = json["city"].asString().unwrapOr("");
 
                 queueInMainThread([this, status = std::move(status), country = std::move(country), city = std::move(city)]() {
-                    m_fetchingGeoIp.store(false);
+                    fetchingGeo = false;
                     if (status != "success" || country.empty() || city.empty()) {
                         Notification::create("GeoIP did not return Country/City", NotificationIcon::Error, 2.f)->show();
                         return;
@@ -287,41 +287,37 @@ namespace {
             }).detach();
         }
 
-        // Debug utility from settings to confirm notifications are visible.
         void showTestNotification() {
             queueInMainThread([]() {
                 Notification::create("Test: Athan notification works", NotificationIcon::Info, 2.5f)->show();
             });
         }
 
-        // Debug utility that forces one prayer to trigger "now".
         void simulatePrayerNow() {
             auto nowTs = std::time(nullptr);
             std::tm localTm {};
 #ifdef GEODE_IS_WINDOWS
-            // Windows uses localtime_s instead of localtime_r for thread-safe local time.
             localtime_s(&localTm, &nowTs);
 #else
             localtime_r(&nowTs, &localTm);
 #endif
             auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
-            auto date = currentDateKey();
+            auto date = get_now_time_string();
             auto prayerName = std::string("Fajr");
 
-            m_prayerMinutes[prayerName] = currentMinute;
-            m_notifiedKeys.erase(fmt::format("{}-{}", date, prayerName));
+            pray_times[prayerName] = currentMinute;
+            done_notifs.erase(fmt::format("{}-{}", date, prayerName));
 
             Notification::create("Simulating Fajr at current time", NotificationIcon::Info, 2.f)->show();
             this->tick(0.f);
         }
 
         std::optional<std::pair<std::string, int>> nextPrayerForNow() const {
-            if (m_prayerMinutes.empty()) return std::nullopt;
+            if (pray_times.empty()) return std::nullopt;
 
             auto nowTs = std::time(nullptr);
             std::tm localTm {};
 #ifdef GEODE_IS_WINDOWS
-            // Windows uses localtime_s instead of localtime_r for thread-safe local time.
             localtime_s(&localTm, &nowTs);
 #else
             localtime_r(&nowTs, &localTm);
@@ -329,14 +325,14 @@ namespace {
             auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
 
             for (auto const* prayerName : kPrayerNames) {
-                auto it = m_prayerMinutes.find(prayerName);
-                if (it == m_prayerMinutes.end()) continue;
+                auto it = pray_times.find(prayerName);
+                if (it == pray_times.end()) continue;
                 if (it->second >= currentMinute) return std::make_pair(std::string(prayerName), it->second);
             }
 
             for (auto const* prayerName : kPrayerNames) {
-                auto it = m_prayerMinutes.find(prayerName);
-                if (it == m_prayerMinutes.end()) continue;
+                auto it = pray_times.find(prayerName);
+                if (it == pray_times.end()) continue;
                 return std::make_pair(std::string(prayerName), it->second);
             }
             return std::nullopt;
@@ -345,16 +341,16 @@ namespace {
         std::string nextPrayerText() const {
             auto nextPrayer = this->nextPrayerForNow();
             if (!nextPrayer) return "Next Salah: fetching...";
-            return fmt::format("Next Salah: {} - at {}", nextPrayer->first, formatMinuteOfDay(nextPrayer->second));
+            return fmt::format("Next Salah: {} - at {}", nextPrayer->first, format_time(nextPrayer->second));
         }
 
         void dismissNextPrayerAlertForSession() {
-            if (m_prayerMinutes.empty()) {
+            if (pray_times.empty()) {
                 Notification::create("Prayer times not ready yet", NotificationIcon::Info, 2.f)->show();
                 return;
             }
 
-            m_skipNextPrayerAlert = true;
+            skip_it = true;
             auto nextPrayer = this->nextPrayerForNow();
             if (nextPrayer) {
                 Notification::create(
@@ -365,7 +361,7 @@ namespace {
             }
         }
 
-        // Plays default bundled MP3 unless user provided a custom path in settings.
+        // plays the adhan sound
         void playConfiguredAdhan() {
             auto selected = Mod::get()->getSettingValue<std::filesystem::path>("adhan-mp3");
             std::filesystem::path audioPath;
@@ -452,10 +448,11 @@ class $modify(AthanPauseLayerHook, PauseLayer) {
         g_runtime->dismissNextPrayerAlertForSession();
     }
 
-    bool init(bool p0) {
-        if (!PauseLayer::init(p0)) return false;
-        if (!g_runtime) return true;
+    void customSetup() {
+        PauseLayer::customSetup();
+        if (!g_runtime) return;
 
+        // TODO: idk for now lol
         if (auto leftMenu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("left-button-menu"))) {
             auto buttonSprite = CCSprite::create("button.png"_spr);
             if (!buttonSprite) {
@@ -485,7 +482,5 @@ class $modify(AthanPauseLayerHook, PauseLayer) {
                 this->addChild(nextText);
             }
         }
-
-        return true;
     }
 };
