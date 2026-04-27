@@ -148,10 +148,10 @@ namespace {
 
             try {
                 if (json.contains("daily_cache") && json["daily_cache"].isObject()) {
-                    for (auto const& [date, times] : json["daily_cache"].asObject().unwrap()) {
+                    for (auto const& [date, times] : json["daily_cache"]) {
                         DayTimes dayTimes;
                         if (times.isObject()) {
-                            for (auto const& [prayer, minute] : times.asObject().unwrap()) {
+                            for (auto const& [prayer, minute] : times) {
                                 if (minute.isNumber()) {
                                     dayTimes[prayer] = static_cast<int>(minute.asInt().unwrap());
                                 }
@@ -161,7 +161,7 @@ namespace {
                     }
                 }
                 if (json.contains("month_cache_keys") && json["month_cache_keys"].isArray()) {
-                    for (auto const& key : json["month_cache_keys"].asArray().unwrap()) {
+                    for (auto const& key : json["month_cache_keys"]) {
                         if (key.isString()) {
                             month_cache_keys.insert(key.asString().unwrap());
                         }
