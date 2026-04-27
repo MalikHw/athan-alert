@@ -7,7 +7,6 @@
 #include <Geode/utils/web.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 
-#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
@@ -20,728 +19,516 @@
 using namespace geode::prelude;
 namespace web = geode::utils::web;
 
-namespace {
-    // We use one date key so "already notified" tracking resets cleanly each new day.
-    static std::string get_now_time_string() {
-        auto now = std::time(nullptr);
-        std::tm localTm {};
+// ── helpers ────────────────────────────────────────────────────────────────
+
+static std::tm localNow() {
+    auto ts = std::time(nullptr);
+    std::tm t{};
 #ifdef GEODE_IS_WINDOWS
-        localtime_s(&localTm, &now);
+    localtime_s(&t, &ts);
 #else
-        localtime_r(&now, &localTm);
+    localtime_r(&ts, &t);
 #endif
-        char buf[16] {};
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d", &localTm);
-        return buf;
-    }
-
-    static std::string month_key_for(int year, int month) {
-        return fmt::format("{:04d}-{:02d}", year, month);
-    }
-
-    static std::string month_name_upper(int month) {
-        static constexpr const char* kNames[12] = {
-            "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
-            "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
-        };
-        if (month < 1 || month > 12) return "UNKNOWN";
-        return kNames[month - 1];
-    }
-
-    static std::optional<std::string> gregorian_to_date_key(std::string const& ddmmyyyy) {
-        if (ddmmyyyy.size() < 10) return std::nullopt;
-        auto day = ddmmyyyy.substr(0, 2);
-        auto month = ddmmyyyy.substr(3, 2);
-        auto year = ddmmyyyy.substr(6, 4);
-        if (ddmmyyyy[2] != '-' || ddmmyyyy[5] != '-') return std::nullopt;
-        return fmt::format("{}-{}-{}", year, month, day);
-    }
-
-    // parsing is a bitch
-    static std::optional<int> parseMinuteOfDay(std::string value) {
-        auto firstDigit = value.find_first_of("0123456789");
-        if (firstDigit == std::string::npos) return std::nullopt;
-        auto hhmm = value.substr(firstDigit, 5);
-        if (hhmm.size() < 5 || hhmm[2] != ':') return std::nullopt;
-
-        int hour = 0;
-        int minute = 0;
-        try {
-            hour = std::stoi(hhmm.substr(0, 2));
-            minute = std::stoi(hhmm.substr(3, 2));
-        }
-        catch (...) {
-            return std::nullopt;
-        }
-
-        if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return std::nullopt;
-        return hour * 60 + minute;
-    }
-
-    static std::string format_time(int minuteOfDay) {
-        auto hour = minuteOfDay / 60;
-        auto minute = minuteOfDay % 60;
-        auto period = hour >= 12 ? "PM" : "AM";
-        auto hour12 = hour % 12;
-        if (hour12 == 0) hour12 = 12;
-        return fmt::format("{}:{:02d} {}", hour12, minute, period);
-    }
-
-    class AthanRuntime : public CCNode {
-    protected:
-        using DayTimes = std::unordered_map<std::string, int>;
-        std::unordered_map<std::string, int> pray_times;
-        std::unordered_map<std::string, DayTimes> daily_cache;
-        std::unordered_set<std::string> month_cache_keys;
-        std::unordered_set<std::string> done_notifs;
-        bool is_fetching = false;
-        bool fetchingGeo = false;
-        bool showed_next_month_warning = false;
-        std::time_t last_time = 0;
-        std::string lastDate;
-        bool skip_it = false;
-        
-
-        static constexpr const char* kPrayerNames[5] = {
-            "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"
-        };
-
-        void save_cache_to_disk() {
-            auto path = Mod::get()->getSaveDir() / "athan_cache.json";
-            auto json = matjson::Value::object();
-            
-            auto daily = matjson::Value::object();
-            for (auto const& [date, times] : daily_cache) {
-                auto dayTimes = matjson::Value::object();
-                for (auto const& [prayer, minute] : times) {
-                    dayTimes[prayer] = minute;
-                }
-                daily[date] = dayTimes;
-            }
-            json["daily_cache"] = daily;
-
-            auto months = matjson::Value::array();
-            for (auto const& key : month_cache_keys) {
-                months.push(key);
-            }
-            json["month_cache_keys"] = months;
-
-            auto result = file::writeString(path, json.dump());
-            if (!result) {
-                log::warn("Failed to save athan cache: {}", result.unwrapErr());
-            }
-        }
-
-        void load_cache_from_disk() {
-            auto path = Mod::get()->getSaveDir() / "athan_cache.json";
-            if (!std::filesystem::exists(path)) return;
-
-            auto result = file::readString(path);
-            if (!result) return;
-
-            auto parseResult = matjson::parse(result.unwrap());
-            if (!parseResult) {
-                log::warn("Failed to parse athan cache: {}", parseResult.unwrapErr());
-                return;
-            }
-            auto json = parseResult.unwrap();
-
-            try {
-                if (json.contains("daily_cache") && json["daily_cache"].isObject()) {
-                    for (auto const& [date, times] : json["daily_cache"]) {
-                        DayTimes dayTimes;
-                        if (times.isObject()) {
-                            for (auto const& [prayer, minute] : times) {
-                                if (minute.isNumber()) {
-                                    dayTimes[prayer] = static_cast<int>(minute.asInt().unwrap());
-                                }
-                            }
-                        }
-                        daily_cache[date] = dayTimes;
-                    }
-                }
-                if (json.contains("month_cache_keys") && json["month_cache_keys"].isArray()) {
-                    for (auto const& key : json["month_cache_keys"]) {
-                        if (key.isString()) {
-                            month_cache_keys.insert(key.asString().unwrap());
-                        }
-                    }
-                }
-                this->load_today_from_cache();
-            } catch (std::exception const& e) {
-                log::warn("Failed to process athan cache: {}", e.what());
-            }
-        }
-
-        // tick every 20s
-        bool init() override {
-            if (!CCNode::init()) return false;
-
-            this->load_cache_from_disk();
-            this->schedule(schedule_selector(AthanRuntime::tick), 20.f);
-            this->fetchPrayerTimesAsync();
-            return true;
-        }
-
-        void load_today_from_cache() {
-            auto todayKey = get_now_time_string();
-            auto it = daily_cache.find(todayKey);
-            if (it == daily_cache.end()) {
-                pray_times.clear();
-                return;
-            }
-            pray_times = it->second;
-        }
-
-        std::pair<int, int> local_year_month() const {
-            auto nowTs = std::time(nullptr);
-            std::tm localTm {};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&localTm, &nowTs);
-#else
-            localtime_r(&nowTs, &localTm);
-#endif
-            return { localTm.tm_year + 1900, localTm.tm_mon + 1 };
-        }
-
-        bool have_months_for_now_and_next() const {
-            auto [year, month] = this->local_year_month();
-            auto nextMonth = month + 1;
-            auto nextYear = year;
-            if (nextMonth > 12) {
-                nextMonth = 1;
-                nextYear++;
-            }
-            auto nowKey = month_key_for(year, month);
-            auto nextKey = month_key_for(nextYear, nextMonth);
-            return month_cache_keys.contains(nowKey) && month_cache_keys.contains(nextKey);
-        }
-
-        static std::optional<std::unordered_map<std::string, DayTimes>> fetch_month_calendar(
-            std::string const& country, std::string const& city, int method, int year, int month
-        ) {
-            auto request = web::WebRequest();
-            request.timeout(std::chrono::seconds(20));
-            request.followRedirects(true);
-            request.param("country", country);
-            request.param("city", city);
-            request.param("method", method);
-            request.param("year", year);
-            request.param("month", month);
-
-            auto response = request.getSync("https://api.aladhan.com/v1/calendarByCity");
-            if (!response.ok()) return std::nullopt;
-
-            auto jsonRes = response.json();
-            if (!jsonRes) return std::nullopt;
-            auto json = jsonRes.unwrap();
-
-            auto dataRes = json["data"].asArray();
-            if (!dataRes) return std::nullopt;
-
-            std::unordered_map<std::string, DayTimes> out;
-            for (auto const& dayEntry : dataRes.unwrap()) {
-                auto gregDate = dayEntry["date"]["gregorian"]["date"].asString().unwrapOr("");
-                auto dateKey = gregorian_to_date_key(gregDate);
-                if (!dateKey) continue;
-
-                DayTimes parsed;
-                auto timings = dayEntry["timings"];
-                for (auto const* prayerName : kPrayerNames) {
-                    auto prayerText = timings[prayerName].asString().unwrapOr("");
-                    auto minute = parseMinuteOfDay(prayerText);
-                    if (!minute) continue;
-                    parsed[prayerName] = *minute;
-                }
-                if (!parsed.empty()) out[*dateKey] = std::move(parsed);
-            }
-
-            if (out.empty()) return std::nullopt;
-            return out;
-        }
-
-        void tick(float) {
-            auto date = get_now_time_string();
-            auto nowTs = std::time(nullptr);
-
-            if (date != lastDate) {
-                lastDate = date;
-                done_notifs.clear();
-                this->load_today_from_cache();
-            }
-
-            if (!this->have_months_for_now_and_next() && !is_fetching) {
-                this->fetchPrayerTimesAsync();
-            }
-
-            if ((nowTs - last_time) > 21600 && !is_fetching) {
-                this->fetchPrayerTimesAsync();
-            }
-
-            if (pray_times.empty()) return;
-
-            std::tm localTm {};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&localTm, &nowTs);
-#else
-            localtime_r(&nowTs, &localTm);
-#endif
-            auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
-
-            for (auto const* prayerName : kPrayerNames) {
-                auto it = pray_times.find(prayerName);
-                if (it == pray_times.end()) continue;
-                auto prayerMinute = it->second;
-
-                if (Mod::get()->getSettingValue<bool>("remind-one-minute-before")) {
-                    if (prayerMinute - 1 == currentMinute) {
-                        auto preKey = fmt::format("{}-{}-pre", date, prayerName);
-                        if (done_notifs.insert(preKey).second) {
-                            Notification::create(
-                                fmt::format("{} starts in 1 minute", prayerName),
-                                NotificationIcon::Info,
-                                2.5f
-                            )->show();
-                        }
-                    }
-                }
-
-                if (prayerMinute != currentMinute) continue;
-
-                auto notifyKey = fmt::format("{}-{}", date, prayerName);
-                if (!done_notifs.insert(notifyKey).second) continue;
-
-                if (skip_it) {
-                    skip_it = false;
-                    Notification::create(
-                        fmt::format("Skipped {} alert for this session", prayerName),
-                        NotificationIcon::Info,
-                        2.5f
-                    )->show();
-                    continue;
-                }
-
-                Notification::create(
-                    fmt::format("It's {} prayer time", prayerName),
-                    NotificationIcon::Info,
-                    3.f
-                )->show();
-
-                this->playConfiguredAdhan();
-
-                if (Mod::get()->getSettingValue<bool>("auto-pause-on-prayer") && PlayLayer::get() != nullptr) {
-                    CCDirector::sharedDirector()->pause();
-                }
-            }
-        }
-
-    public:
-        static AthanRuntime* create() {
-            auto ret = new AthanRuntime();
-            if (ret && ret->init()) {
-                ret->autorelease();
-                return ret;
-            }
-            CC_SAFE_DELETE(ret);
-            return nullptr;
-        }
-
-        // fetch shit from api
-        void fetchPrayerTimesAsync() {
-            if (is_fetching) return;
-            if (this->have_months_for_now_and_next()) {
-                this->load_today_from_cache();
-                return;
-            }
-            is_fetching = true;
-
-            auto country = Mod::get()->getSettingValue<std::string>("country");
-            auto city = Mod::get()->getSettingValue<std::string>("city");
-            auto method = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int>("calculation-method")), 1, 22);
-
-            std::thread([this, country = std::move(country), city = std::move(city), method]() {
-                auto [year, month] = this->local_year_month();
-                auto nextMonth = month + 1;
-                auto nextYear = year;
-                if (nextMonth > 12) {
-                    nextMonth = 1;
-                    nextYear++;
-                }
-
-                auto thisMonth = fetch_month_calendar(country, city, method, year, month);
-                auto nextMonthData = fetch_month_calendar(country, city, method, nextYear, nextMonth);
-                auto thisMonthKey = month_key_for(year, month);
-                auto nextMonthKey = month_key_for(nextYear, nextMonth);
-
-                queueInMainThread([this, thisMonth = std::move(thisMonth), nextMonthData = std::move(nextMonthData), thisMonthKey, nextMonthKey]() mutable {
-                    if (thisMonth) {
-                        for (auto& [dayKey, dayTimes] : *thisMonth) {
-                            daily_cache[dayKey] = std::move(dayTimes);
-                        }
-                        month_cache_keys.insert(thisMonthKey);
-                    }
-                    if (nextMonthData) {
-                        for (auto& [dayKey, dayTimes] : *nextMonthData) {
-                            daily_cache[dayKey] = std::move(dayTimes);
-                        }
-                        month_cache_keys.insert(nextMonthKey);
-                        showed_next_month_warning = false;
-                    }
-                    else if (!showed_next_month_warning) {
-                        showed_next_month_warning = true;
-                        Notification::create("Please be online so prayer times work", NotificationIcon::Info, 3.f)->show();
-                    }
-
-                    this->load_today_from_cache();
-                    last_time = std::time(nullptr);
-                    lastDate = get_now_time_string();
-                    done_notifs.clear();
-                    is_fetching = false;
-
-                    if (thisMonth) {
-                        this->save_cache_to_disk();
-                        Notification::create("Athan month updated", NotificationIcon::Info, 1.5f)->show();
-                    }
-                });
-            }).detach();
-        }
-
-        // geoip shit
-        void detectLocationByGeoIpAsync() {
-            if (fetchingGeo) return;
-            fetchingGeo = true;
-
-            std::thread([this]() {
-                auto request = web::WebRequest();
-                request.timeout(std::chrono::seconds(10));
-                request.followRedirects(true);
-
-                auto response = request.getSync("http://ip-api.com/json");
-                if (!response.ok()) {
-                    queueInMainThread([this, code = response.code()]() {
-                        fetchingGeo = false;
-                        Notification::create(
-                            fmt::format("GeoIP request failed (HTTP {})", code),
-                            NotificationIcon::Error,
-                            2.f
-                        )->show();
-                    });
-                    return;
-                }
-
-                auto jsonRes = response.json();
-                if (!jsonRes) {
-                    queueInMainThread([this]() {
-                        fetchingGeo = false;
-                        Notification::create("GeoIP JSON parse failed", NotificationIcon::Error, 2.f)->show();
-                    });
-                    return;
-                }
-
-                auto json = jsonRes.unwrap();
-                auto status = json["status"].asString().unwrapOr("");
-                auto country = json["country"].asString().unwrapOr("");
-                auto city = json["city"].asString().unwrapOr("");
-
-                queueInMainThread([this, status = std::move(status), country = std::move(country), city = std::move(city)]() {
-                    fetchingGeo = false;
-                    if (status != "success" || country.empty() || city.empty()) {
-                        Notification::create("GeoIP did not return Country/City", NotificationIcon::Error, 2.f)->show();
-                        return;
-                    }
-
-                    Mod::get()->setSettingValue<std::string>("country", country);
-                    Mod::get()->setSettingValue<std::string>("city", city);
-
-                    Notification::create(
-                        fmt::format("Location set: {}, {}", city, country),
-                        NotificationIcon::Success,
-                        2.f
-                    )->show();
-
-                    this->fetchPrayerTimesAsync();
-                });
-            }).detach();
-        }
-
-        void showTestNotification() {
-            queueInMainThread([]() {
-                Notification::create("Test: Athan notification works", NotificationIcon::Info, 2.5f)->show();
-            });
-        }
-
-        void simulatePrayerNow() {
-            auto nowTs = std::time(nullptr);
-            std::tm localTm {};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&localTm, &nowTs);
-#else
-            localtime_r(&nowTs, &localTm);
-#endif
-            auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
-            auto date = get_now_time_string();
-            auto prayerName = std::string("Fajr");
-
-            pray_times[prayerName] = currentMinute;
-            done_notifs.erase(fmt::format("{}-{}", date, prayerName));
-
-            Notification::create("Simulating Fajr at current time", NotificationIcon::Info, 2.f)->show();
-            this->tick(0.f);
-        }
-
-        std::optional<std::pair<std::string, int>> nextPrayerForNow() const {
-            if (pray_times.empty()) return std::nullopt;
-
-            auto nowTs = std::time(nullptr);
-            std::tm localTm {};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&localTm, &nowTs);
-#else
-            localtime_r(&nowTs, &localTm);
-#endif
-            auto currentMinute = localTm.tm_hour * 60 + localTm.tm_min;
-
-            for (auto const* prayerName : kPrayerNames) {
-                auto it = pray_times.find(prayerName);
-                if (it == pray_times.end()) continue;
-                if (it->second >= currentMinute) return std::make_pair(std::string(prayerName), it->second);
-            }
-
-            for (auto const* prayerName : kPrayerNames) {
-                auto it = pray_times.find(prayerName);
-                if (it == pray_times.end()) continue;
-                return std::make_pair(std::string(prayerName), it->second);
-            }
-            return std::nullopt;
-        }
-
-        std::string nextPrayerText() const {
-            auto nextPrayer = this->nextPrayerForNow();
-            if (!nextPrayer) return "Next Salah: fetching...";
-            return fmt::format("Next Salah: {} - at {}", nextPrayer->first, format_time(nextPrayer->second));
-        }
-
-        std::string todayPrayerTimesAlertText() const {
-            auto nowTs = std::time(nullptr);
-            std::tm localTm {};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&localTm, &nowTs);
-#else
-            localtime_r(&nowTs, &localTm);
-#endif
-
-            auto getPrayerText = [this](char const* prayer) {
-                auto it = pray_times.find(prayer);
-                if (it == pray_times.end()) return std::string("...");
-                auto minute = it->second;
-                auto hour = minute / 60;
-                auto min = minute % 60;
-                return fmt::format("{}:{:02d}", hour, min);
-            };
-
-            return fmt::format(
-                "PRAYER TIMES OF {} {} {}\n"
-                "Fajr: {}\n"
-                "Dhuhr: {}\n"
-                "Asr: {}\n"
-                "Maghrib: {}\n"
-                "Isha: {}",
-                localTm.tm_mday,
-                month_name_upper(localTm.tm_mon + 1),
-                localTm.tm_year + 1900,
-                getPrayerText("Fajr"),
-                getPrayerText("Dhuhr"),
-                getPrayerText("Asr"),
-                getPrayerText("Maghrib"),
-                getPrayerText("Isha")
-            );
-        }
-
-        void showTodayPrayerTimesPopup() {
-            FLAlertLayer::create(
-                "Prayer Times",
-                this->todayPrayerTimesAlertText(),
-                "OK"
-            )->show();
-        }
-
-        void dismissNextPrayerAlertForSession() {
-            if (pray_times.empty()) {
-                Notification::create("Prayer times not ready yet", NotificationIcon::Info, 2.f)->show();
-                return;
-            }
-
-            skip_it = true;
-            auto nextPrayer = this->nextPrayerForNow();
-            if (nextPrayer) {
-                Notification::create(
-                    fmt::format("Will skip next alert: {}", nextPrayer->first),
-                    NotificationIcon::Success,
-                    2.f
-                )->show();
-            }
-        }
-
-        // plays the adhan sound
-        void playConfiguredAdhan() {
-            if (!Mod::get()->getSettingValue<bool>("enable-adhan-audio")) return;
-            auto selected = Mod::get()->getSettingValue<std::filesystem::path>("adhan-mp3");
-            std::filesystem::path audioPath;
-
-            if (selected.empty()) {
-                audioPath = Mod::get()->getResourcesDir() / "default-adhan.mp3";
-            }
-            else {
-                audioPath = selected;
-            }
-
-            if (!std::filesystem::exists(audioPath)) {
-                log::warn("Athan audio file not found: {}", audioPath.string());
-                return;
-            }
-
-            auto volume = static_cast<float>(Mod::get()->getSettingValue<double>("adhan-volume"));
-            auto engine = FMODAudioEngine::sharedEngine();
-            
-            // FMODAudioEngine doesn't have a direct per-effect volume param in playEffect
-            // but we can scale the volume via the engine's SFX volume temporarily or use the engine's internal methods if accessible.
-            // Since we want to be safe and minimal, we'll use the most common pattern in GD modding for volume scaling.
-            engine->playEffect(audioPath.string(), 1.0f, 0.0f, volume);
-        }
-    };
-
-    AthanRuntime* g_runtime = nullptr;
-
-    static void ensureRuntimeAttached(CCNode* host) {
-        if (!host) return;
-
-        if (!g_runtime) {
-            g_runtime = AthanRuntime::create();
-            if (!g_runtime) return;
-            g_runtime->retain();
-        }
-
-        if (g_runtime->getParent() != host) {
-            g_runtime->removeFromParentAndCleanup(false);
-            host->addChild(g_runtime);
-        }
-    }
+    return t;
 }
 
-$on_mod(Loaded) {
-    ButtonSettingPressedEventV3(Mod::get(), "geoip-actions").listen([](std::string_view buttonKey) {
-        if (buttonKey != "detect-location" || !g_runtime) return;
-        g_runtime->detectLocationByGeoIpAsync();
-    }).leak();
-    ButtonSettingPressedEventV3(Mod::get(), "debug-actions").listen([](std::string_view buttonKey) {
-        if (!g_runtime) return;
+static std::string todayKey() {
+    char buf[16]{};
+    auto t = localNow();
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d", &t);
+    return buf;
+}
 
-        if (buttonKey == "run-test") {
-            g_runtime->showTestNotification();
-            g_runtime->simulatePrayerNow();
+static std::string monthKey(int y, int m) { return fmt::format("{:04d}-{:02d}", y, m); }
+
+static std::optional<std::string> ddmmyyyyToKey(std::string const& s) {
+    if (s.size() < 10 || s[2] != '-' || s[5] != '-') return std::nullopt;
+    return fmt::format("{}-{}-{}", s.substr(6,4), s.substr(3,2), s.substr(0,2));
+}
+
+static std::optional<int> parseMinute(std::string v) {
+    auto p = v.find_first_of("0123456789");
+    if (p == std::string::npos) return std::nullopt;
+    auto hhmm = v.substr(p, 5);
+    if (hhmm.size() < 5 || hhmm[2] != ':') return std::nullopt;
+    try {
+        int h = std::stoi(hhmm.substr(0,2)), m = std::stoi(hhmm.substr(3,2));
+        if (h < 0 || h > 23 || m < 0 || m > 59) return std::nullopt;
+        return h * 60 + m;
+    } catch (...) { return std::nullopt; }
+}
+
+static std::string fmtTime(int min) {
+    int h = min / 60, m = min % 60;
+    int h12 = h % 12; if (!h12) h12 = 12;
+    return fmt::format("{}:{:02d} {}", h12, m, h >= 12 ? "PM" : "AM");
+}
+
+static const char* monthUpper(int m) {
+    static constexpr const char* N[12] = {
+        "JANUARY","FEBRUARY","MARCH","APRIL","MAY","JUNE",
+        "JULY","AUGUST","SEPTEMBER","OCTOBER","NOVEMBER","DECEMBER"
+    };
+    return (m>=1&&m<=12) ? N[m-1] : "UNKNOWN";
+}
+
+static auto& getSetting() { return *Mod::get(); }
+
+// ── runtime ────────────────────────────────────────────────────────────────
+
+static constexpr const char* kPrayers[5] = {"Fajr","Dhuhr","Asr","Maghrib","Isha"};
+
+using DayMap  = std::unordered_map<std::string,int>;       // prayer -> minuteOfDay
+using CacheMap= std::unordered_map<std::string,DayMap>;    // dateKey -> DayMap
+
+class AthanRuntime : public CCNode {
+    CacheMap            m_cache;
+    std::unordered_set<std::string> m_months;   // which year-month we have
+    DayMap              m_today;
+    std::unordered_set<std::string> m_fired;    // "date-prayer[-pre]" already shown
+    bool                m_fetching  = false;
+    bool                m_geoFetch  = false;
+    bool                m_skipNext  = false;
+    std::time_t         m_lastFetch = 0;
+    std::string         m_lastDate;
+
+    // ── cache persistence ──────────────────────────────────────────────────
+
+    void saveCache() {
+        auto j = matjson::Value::object();
+        auto daily = matjson::Value::object();
+        for (auto& [date, times] : m_cache) {
+            auto d = matjson::Value::object();
+            for (auto& [p, min] : times) d[p] = min;
+            daily[date] = d;
+        }
+        j["daily_cache"] = daily;
+        auto arr = matjson::Value::array();
+        for (auto& k : m_months) arr.push(k);
+        j["month_cache_keys"] = arr;
+        file::writeString(Mod::get()->getSaveDir() / "athan_cache.json", j.dump());
+    }
+
+    void loadCache() {
+        auto path = Mod::get()->getSaveDir() / "athan_cache.json";
+        if (!std::filesystem::exists(path)) return;
+        auto raw = file::readString(path);
+        if (!raw) return;
+        auto res = matjson::parse(raw.unwrap());
+        if (!res) return;
+        auto j = res.unwrap();
+        try {
+            if (j.contains("daily_cache") && j["daily_cache"].isObject())
+                for (auto& [date, times] : j["daily_cache"]) {
+                    DayMap dm;
+                    if (times.isObject())
+                        for (auto& [p, v] : times)
+                            if (v.isNumber()) dm[p] = (int)v.asInt().unwrap();
+                    m_cache[date] = dm;
+                }
+            if (j.contains("month_cache_keys") && j["month_cache_keys"].isArray())
+                for (auto& k : j["month_cache_keys"])
+                    if (k.isString()) m_months.insert(k.asString().unwrap());
+            refreshToday();
+        } catch (...) {}
+    }
+
+    // ── init / tick ────────────────────────────────────────────────────────
+
+    bool init() override {
+        if (!CCNode::init()) return false;
+        loadCache();
+        this->schedule(schedule_selector(AthanRuntime::tick), 20.f);
+        fetchAsync();
+        return true;
+    }
+
+    void refreshToday() {
+        auto k = todayKey();
+        auto it = m_cache.find(k);
+        m_today = (it != m_cache.end()) ? it->second : DayMap{};
+    }
+
+    std::pair<int,int> yearMonth() const {
+        auto t = localNow();
+        return { t.tm_year + 1900, t.tm_mon + 1 };
+    }
+
+    bool haveBothMonths() const {
+        auto [y, m] = yearMonth();
+        int ny = y, nm = m + 1;
+        if (nm > 12) { nm = 1; ny++; }
+        return m_months.count(monthKey(y,m)) && m_months.count(monthKey(ny,nm));
+    }
+
+    void tick(float) {
+        auto date = todayKey();
+        auto now  = std::time(nullptr);
+
+        if (date != m_lastDate) {
+            m_lastDate = date;
+            m_fired.clear();
+            refreshToday();
+        }
+
+        // re-fetch every 6 hours or if we're missing months
+        if (!m_fetching && (!haveBothMonths() || (now - m_lastFetch) > 21600))
+            fetchAsync();
+
+        if (m_today.empty()) return;
+
+        auto t   = localNow();
+        int  cur = t.tm_hour * 60 + t.tm_min;
+
+        for (auto* name : kPrayers) {
+            auto it = m_today.find(name);
+            if (it == m_today.end()) continue;
+            int pmin = it->second;
+
+            // 1-min reminder
+            if (getSetting().getSettingValue<bool>("remind-one-minute-before") && pmin - 1 == cur) {
+                auto key = fmt::format("{}-{}-pre", date, name);
+                if (m_fired.insert(key).second)
+                    Notification::create(fmt::format("{} starts in 1 minute", name), NotificationIcon::Info, 2.5f)->show();
+            }
+
+            if (pmin != cur) continue;
+
+            auto key = fmt::format("{}-{}", date, name);
+            if (!m_fired.insert(key).second) continue;  // already fired
+
+            if (m_skipNext) {
+                m_skipNext = false;
+                Notification::create(fmt::format("Skipped {} alert", name), NotificationIcon::Info, 2.5f)->show();
+                continue;
+            }
+
+            // show notification + play audio
+            Notification::create(fmt::format("It's {} prayer time!", name), NotificationIcon::Info, 3.f)->show();
+            playAdhan();
+
+            if (getSetting().getSettingValue<bool>("auto-pause-on-prayer") && PlayLayer::get())
+                CCDirector::sharedDirector()->pause();
+        }
+    }
+
+public:
+    static AthanRuntime* create() {
+        auto* r = new AthanRuntime();
+        if (r && r->init()) { r->autorelease(); return r; }
+        CC_SAFE_DELETE(r);
+        return nullptr;
+    }
+
+    // ── fetch ──────────────────────────────────────────────────────────────
+
+    static std::optional<CacheMap> fetchMonth(
+        std::string const& country, std::string const& city, int method, int y, int m
+    ) {
+        auto req = web::WebRequest();
+        req.timeout(std::chrono::seconds(20));
+        req.followRedirects(true);
+        req.param("country", country).param("city", city)
+           .param("method", method).param("year", y).param("month", m);
+
+        auto res = req.getSync("https://api.aladhan.com/v1/calendarByCity");
+        if (!res.ok()) return std::nullopt;
+        auto jr = res.json();
+        if (!jr) return std::nullopt;
+
+        auto data = jr.unwrap()["data"].asArray();
+        if (!data) return std::nullopt;
+
+        CacheMap out;
+        for (auto& day : data.unwrap()) {
+            auto dateKey = ddmmyyyyToKey(day["date"]["gregorian"]["date"].asString().unwrapOr(""));
+            if (!dateKey) continue;
+            DayMap dm;
+            auto& timings = day["timings"];
+            for (auto* p : kPrayers) {
+                auto min = parseMinute(timings[p].asString().unwrapOr(""));
+                if (min) dm[p] = *min;
+            }
+            if (!dm.empty()) out[*dateKey] = std::move(dm);
+        }
+        return out.empty() ? std::nullopt : std::make_optional(std::move(out));
+    }
+
+    void fetchAsync() {
+        if (m_fetching || haveBothMonths()) { if (!m_fetching) refreshToday(); return; }
+        m_fetching = true;
+
+        auto country = getSetting().getSettingValue<std::string>("country");
+        auto city    = getSetting().getSettingValue<std::string>("city");
+        auto method  = std::clamp((int)getSetting().getSettingValue<int>("calculation-method"), 1, 22);
+
+        std::thread([this, country, city, method]() {
+            auto [y, m] = yearMonth();
+            int ny = y, nm = m + 1;
+            if (nm > 12) { nm = 1; ny++; }
+
+            auto cur  = fetchMonth(country, city, method, y, m);
+            auto next = fetchMonth(country, city, method, ny, nm);
+            auto ck   = monthKey(y, m);
+            auto nk   = monthKey(ny, nm);
+
+            queueInMainThread([this, cur = std::move(cur), next = std::move(next), ck, nk]() mutable {
+                auto merge = [&](std::optional<CacheMap>& src, std::string const& key) {
+                    if (!src) return false;
+                    for (auto& [k, v] : *src) m_cache[k] = std::move(v);
+                    m_months.insert(key);
+                    return true;
+                };
+                bool ok1 = merge(cur, ck);
+                bool ok2 = merge(next, nk);
+
+                if (!ok2)
+                    Notification::create("Go online so next month's prayer times load", NotificationIcon::Info, 3.f)->show();
+
+                refreshToday();
+                m_lastFetch = std::time(nullptr);
+                m_lastDate  = todayKey();
+                m_fired.clear();
+                m_fetching  = false;
+
+                if (ok1) {
+                    saveCache();
+                    Notification::create("Prayer times updated!", NotificationIcon::Success, 1.5f)->show();
+                }
+            });
+        }).detach();
+    }
+
+    // ── geo-ip ─────────────────────────────────────────────────────────────
+
+    void detectGeoIpAsync() {
+        if (m_geoFetch) return;
+        m_geoFetch = true;
+        std::thread([this]() {
+            auto req = web::WebRequest();
+            req.timeout(std::chrono::seconds(10)).followRedirects(true);
+            auto res = req.getSync("http://ip-api.com/json");
+
+            if (!res.ok()) {
+                queueInMainThread([this, code = res.code()]() {
+                    m_geoFetch = false;
+                    Notification::create(fmt::format("GeoIP failed (HTTP {})", code), NotificationIcon::Error, 2.f)->show();
+                });
+                return;
+            }
+
+            auto jr = res.json();
+            if (!jr) {
+                queueInMainThread([this]() {
+                    m_geoFetch = false;
+                    Notification::create("GeoIP parse failed", NotificationIcon::Error, 2.f)->show();
+                });
+                return;
+            }
+
+            auto j       = jr.unwrap();
+            auto status  = j["status"].asString().unwrapOr("");
+            auto country = j["country"].asString().unwrapOr("");
+            auto city    = j["city"].asString().unwrapOr("");
+
+            queueInMainThread([this, status, country, city]() {
+                m_geoFetch = false;
+                if (status != "success" || country.empty() || city.empty()) {
+                    Notification::create("GeoIP couldn't find your location", NotificationIcon::Error, 2.f)->show();
+                    return;
+                }
+                getSetting().setSettingValue<std::string>("country", country);
+                getSetting().setSettingValue<std::string>("city", city);
+                Notification::create(fmt::format("Location: {}, {}", city, country), NotificationIcon::Success, 2.f)->show();
+                // invalidate months so we re-fetch with new city
+                m_months.clear();
+                fetchAsync();
+            });
+        }).detach();
+    }
+
+    // ── audio ──────────────────────────────────────────────────────────────
+
+    void playAdhan() {
+        if (!getSetting().getSettingValue<bool>("enable-adhan-audio")) return;
+
+        auto selected = getSetting().getSettingValue<std::filesystem::path>("adhan-mp3");
+        auto defPath  = Mod::get()->getResourcesDir() / "default-adhan.mp3";
+
+        // FIX: use default if selected is empty OR doesn't exist on disk
+        auto path = (selected.empty() || !std::filesystem::exists(selected)) ? defPath : selected;
+
+        if (!std::filesystem::exists(path)) {
+            log::warn("Adhan audio not found: {}", path.string());
             return;
         }
-    }).leak();
 
-    listenForSettingChanges<std::string_view>("country", [](std::string_view) {
-        if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    })->leak();
-    listenForSettingChanges<std::string_view>("city", [](std::string_view) {
-        if (g_runtime) g_runtime->fetchPrayerTimesAsync();
-    })->leak();
-    listenForSettingChanges<int64_t>("calculation-method", [](int64_t) {
-        if (g_runtime) {
-            g_runtime->fetchPrayerTimesAsync();
+        auto vol = (float)getSetting().getSettingValue<double>("adhan-volume");
+        FMODAudioEngine::sharedEngine()->playEffect(path.string(), 1.f, 0.f, vol);
+    }
+
+    // ── misc public ────────────────────────────────────────────────────────
+
+    void testNotification() {
+        Notification::create("Test: Athan notification works!", NotificationIcon::Info, 2.5f)->show();
+        // simulate Fajr right now
+        auto cur = localNow();
+        m_today["Fajr"] = cur.tm_hour * 60 + cur.tm_min;
+        m_fired.erase(fmt::format("{}-Fajr", todayKey()));
+        Notification::create("Simulating Fajr now", NotificationIcon::Info, 2.f)->show();
+        tick(0.f);
+    }
+
+    void skipNextAlert() {
+        if (m_today.empty()) {
+            Notification::create("Prayer times not ready yet", NotificationIcon::Info, 2.f)->show();
+            return;
         }
-    })->leak();
+        m_skipNext = true;
+        auto next = nextPrayer();
+        if (next) Notification::create(fmt::format("Will skip: {}", next->first), NotificationIcon::Success, 2.f)->show();
+    }
+
+    std::optional<std::pair<std::string,int>> nextPrayer() const {
+        if (m_today.empty()) return std::nullopt;
+        auto t   = localNow();
+        int  cur = t.tm_hour * 60 + t.tm_min;
+        // first prayer at or after current minute
+        for (auto* p : kPrayers) {
+            auto it = m_today.find(p);
+            if (it != m_today.end() && it->second >= cur)
+                return std::make_pair(std::string(p), it->second);
+        }
+        // wrap around to first prayer tomorrow
+        for (auto* p : kPrayers) {
+            auto it = m_today.find(p);
+            if (it != m_today.end())
+                return std::make_pair(std::string(p), it->second);
+        }
+        return std::nullopt;
+    }
+
+    std::string nextPrayerText() const {
+        auto n = nextPrayer();
+        return n ? fmt::format("Next Salah: {} at {}", n->first, fmtTime(n->second))
+                 : "Next Salah: fetching...";
+    }
+
+    void showTimesPopup() {
+        auto t = localNow();
+        auto get = [&](const char* p) {
+            auto it = m_today.find(p);
+            if (it == m_today.end()) return std::string("...");
+            return fmt::format("{}:{:02d}", it->second/60, it->second%60);
+        };
+        FLAlertLayer::create("Prayer Times",
+            fmt::format("PRAYER TIMES OF {} {} {}\nFajr: {}\nDhuhr: {}\nAsr: {}\nMaghrib: {}\nIsha: {}",
+                t.tm_mday, monthUpper(t.tm_mon+1), t.tm_year+1900,
+                get("Fajr"), get("Dhuhr"), get("Asr"), get("Maghrib"), get("Isha")),
+            "OK")->show();
+    }
+};
+
+// ── global singleton ───────────────────────────────────────────────────────
+
+static AthanRuntime* g_runtime = nullptr;
+
+static void ensureRuntime(CCNode* host) {
+    if (!host) return;
+    if (!g_runtime) {
+        g_runtime = AthanRuntime::create();
+        if (!g_runtime) return;
+        g_runtime->retain();
+    }
+    if (g_runtime->getParent() != host) {
+        g_runtime->removeFromParentAndCleanup(false);
+        host->addChild(g_runtime);
+    }
 }
 
-class $modify(AthanMenuLayerHook, MenuLayer) {
-    void onTimesPopup(CCObject*) {
-        if (!g_runtime) return;
-        g_runtime->showTodayPrayerTimesPopup();
-    }
+// ── mod load ───────────────────────────────────────────────────────────────
+
+$on_mod(Loaded) {
+    ButtonSettingPressedEventV3(Mod::get(), "geoip-actions").listen([](std::string_view btn) {
+        if (btn == "detect-location" && g_runtime) g_runtime->detectGeoIpAsync();
+    }).leak();
+
+    ButtonSettingPressedEventV3(Mod::get(), "debug-actions").listen([](std::string_view btn) {
+        if (btn == "run-test" && g_runtime) g_runtime->testNotification();
+    }).leak();
+
+    auto refetch = [](auto) { if (g_runtime) { g_runtime->fetchAsync(); } };
+    listenForSettingChanges<std::string_view>("country",            refetch)->leak();
+    listenForSettingChanges<std::string_view>("city",               refetch)->leak();
+    listenForSettingChanges<int64_t>("calculation-method",          refetch)->leak();
+}
+
+// ── layer hooks ────────────────────────────────────────────────────────────
+
+class $modify(AthanMenuLayer, MenuLayer) {
+    void onTimesPopup(CCObject*) { if (g_runtime) g_runtime->showTimesPopup(); }
 
     bool init() {
         if (!MenuLayer::init()) return false;
-        ensureRuntimeAttached(this);
+        ensureRuntime(this);
 
-        if (auto bottomMenu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("bottom-menu"))) {
-            auto buttonSprite = CCSprite::create("button2.png"_spr);
-            if (!buttonSprite) {
-                buttonSprite = CCSprite::createWithSpriteFrameName("GJ_infoIcon_001.png");
-            }
-            if (buttonSprite) {
-                buttonSprite->setScale(0.58f);
-                auto prayerTimesButton = CCMenuItemSpriteExtra::create(
-                    buttonSprite,
-                    this,
-                    menu_selector(AthanMenuLayerHook::onTimesPopup)
-                );
-                prayerTimesButton->setID("prayer-times-button");
-                bottomMenu->addChild(prayerTimesButton);
-                bottomMenu->updateLayout();
+        if (auto* menu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("bottom-menu"))) {
+            auto* spr = CCSprite::create("button2.png"_spr);
+            if (!spr) spr = CCSprite::createWithSpriteFrameName("GJ_infoIcon_001.png");
+            if (spr) {
+                spr->setScale(0.58f);
+                auto* btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(AthanMenuLayer::onTimesPopup));
+                btn->setID("prayer-times-button");
+                menu->addChild(btn);
+                menu->updateLayout();
             }
         }
         return true;
     }
 };
 
-class $modify(AthanPlayLayerHook, PlayLayer) {
+class $modify(AthanPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        ensureRuntimeAttached(this);
+        ensureRuntime(this);
         return true;
     }
 };
 
-class $modify(AthanPauseLayerHook, PauseLayer) {
-    void onDismissNextPrayer(CCObject*) {
-        if (!g_runtime) return;
-        g_runtime->dismissNextPrayerAlertForSession();
-    }
+class $modify(AthanPauseLayer, PauseLayer) {
+    void onDismiss(CCObject*) { if (g_runtime) g_runtime->skipNextAlert(); }
 
-    void updateNextSalahLabel(float) {
+    void updateLabel(float) {
         if (!g_runtime) return;
-        if (auto label = typeinfo_cast<CCLabelBMFont*>(this->getChildByID("next-salah-label"))) {
-            label->setString(g_runtime->nextPrayerText().c_str());
-        }
+        if (auto* lbl = typeinfo_cast<CCLabelBMFont*>(this->getChildByID("next-salah-label")))
+            lbl->setString(g_runtime->nextPrayerText().c_str());
     }
 
     void customSetup() {
         PauseLayer::customSetup();
         if (!g_runtime) return;
 
-        // TODO: idk for now lol
-        if (auto leftMenu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("left-button-menu"))) {
-            auto buttonSprite = CCSprite::create("button.png"_spr);
-            if (!buttonSprite) {
-                buttonSprite = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
-            }
-
-            if (buttonSprite) {
-                buttonSprite->setScale(0.6f);
-                auto dismissButton = CCMenuItemSpriteExtra::create(
-                    buttonSprite,
-                    this,
-                    menu_selector(AthanPauseLayerHook::onDismissNextPrayer)
-                );
-                dismissButton->setID("dismiss-next-prayer-button");
-                leftMenu->addChild(dismissButton);
-                leftMenu->updateLayout();
+        if (auto* menu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("left-button-menu"))) {
+            auto* spr = CCSprite::create("button.png"_spr);
+            if (!spr) spr = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
+            if (spr) {
+                spr->setScale(0.6f);
+                auto* btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(AthanPauseLayer::onDismiss));
+                btn->setID("dismiss-next-prayer-button");
+                menu->addChild(btn);
+                menu->updateLayout();
             }
         }
 
-        if (auto playButton = this->getChildByIDRecursive("play-button")) {
-            auto nextText = CCLabelBMFont::create(g_runtime->nextPrayerText().c_str(), "goldFont.fnt");
-            if (nextText) {
-                nextText->setScale(0.35f);
-                nextText->setAnchorPoint({0.5f, 1.0f});
-                nextText->setPosition({playButton->getPositionX(), playButton->getPositionY() - 32.f});
-                nextText->setID("next-salah-label");
-                this->addChild(nextText);
-                
-                this->schedule(schedule_selector(AthanPauseLayerHook::updateNextSalahLabel), 1.0f);
+        if (auto* play = this->getChildByIDRecursive("play-button")) {
+            auto* lbl = CCLabelBMFont::create(g_runtime->nextPrayerText().c_str(), "goldFont.fnt");
+            if (lbl) {
+                lbl->setScale(0.35f);
+                lbl->setAnchorPoint({0.5f, 1.f});
+                lbl->setPosition({play->getPositionX(), play->getPositionY() - 32.f});
+                lbl->setID("next-salah-label");
+                this->addChild(lbl);
+                this->schedule(schedule_selector(AthanPauseLayer::updateLabel), 1.f);
             }
         }
     }
