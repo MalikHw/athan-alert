@@ -18,7 +18,7 @@
     },
     "resources": {
         "files": ["resources/default-adhan.mp3"],
-        "sprites": ["resources/button.png"]
+        "sprites": ["resources/button.png", "resources/button2.png"]
     },
     "settings": {
         "country": {
@@ -71,10 +71,9 @@
         "debug-actions": {
             "type": "button",
             "name": "Debug Test",
-            "description": "Quick test tools for notifications.",
+            "description": "Quick test tool for notifications.",
             "buttons": {
-                "test-notification": "Show Test Notification",
-                "simulate-prayer-now": "Simulate Prayer Time Now"
+                "run-test": "Run Test"
             }
         }
     }

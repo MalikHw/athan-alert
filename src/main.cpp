@@ -7,7 +7,6 @@
 #include <Geode/utils/web.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
@@ -33,6 +32,28 @@ namespace {
         char buf[16] {};
         std::strftime(buf, sizeof(buf), "%Y-%m-%d", &localTm);
         return buf;
+    }
+
+    static std::string month_key_for(int year, int month) {
+        return fmt::format("{:04d}-{:02d}", year, month);
+    }
+
+    static std::string month_name_upper(int month) {
+        static constexpr const char* kNames[12] = {
+            "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+            "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"
+        };
+        if (month < 1 || month > 12) return "UNKNOWN";
+        return kNames[month - 1];
+    }
+
+    static std::optional<std::string> gregorian_to_date_key(std::string const& ddmmyyyy) {
+        if (ddmmyyyy.size() < 10) return std::nullopt;
+        auto day = ddmmyyyy.substr(0, 2);
+        auto month = ddmmyyyy.substr(3, 2);
+        auto year = ddmmyyyy.substr(6, 4);
+        if (ddmmyyyy[2] != '-' || ddmmyyyy[5] != '-') return std::nullopt;
+        return fmt::format("{}-{}-{}", year, month, day);
     }
 
     // parsing is a bitch
@@ -67,10 +88,14 @@ namespace {
 
     class AthanRuntime : public CCNode {
     protected:
+        using DayTimes = std::unordered_map<std::string, int>;
         std::unordered_map<std::string, int> pray_times;
+        std::unordered_map<std::string, DayTimes> daily_cache;
+        std::unordered_set<std::string> month_cache_keys;
         std::unordered_set<std::string> done_notifs;
         bool is_fetching = false;
         bool fetchingGeo = false;
+        bool showed_next_month_warning = false;
         std::time_t last_time = 0;
         std::string lastDate;
         bool skip_it = false;
@@ -88,16 +113,98 @@ namespace {
             return true;
         }
 
+        void load_today_from_cache() {
+            auto todayKey = get_now_time_string();
+            auto it = daily_cache.find(todayKey);
+            if (it == daily_cache.end()) {
+                pray_times.clear();
+                return;
+            }
+            pray_times = it->second;
+        }
+
+        std::pair<int, int> local_year_month() const {
+            auto nowTs = std::time(nullptr);
+            std::tm localTm {};
+#ifdef GEODE_IS_WINDOWS
+            localtime_s(&localTm, &nowTs);
+#else
+            localtime_r(&nowTs, &localTm);
+#endif
+            return { localTm.tm_year + 1900, localTm.tm_mon + 1 };
+        }
+
+        bool have_months_for_now_and_next() const {
+            auto [year, month] = this->local_year_month();
+            auto nextMonth = month + 1;
+            auto nextYear = year;
+            if (nextMonth > 12) {
+                nextMonth = 1;
+                nextYear++;
+            }
+            auto nowKey = month_key_for(year, month);
+            auto nextKey = month_key_for(nextYear, nextMonth);
+            return month_cache_keys.contains(nowKey) && month_cache_keys.contains(nextKey);
+        }
+
+        static std::optional<std::unordered_map<std::string, DayTimes>> fetch_month_calendar(
+            std::string const& country, std::string const& city, int method, int year, int month
+        ) {
+            auto request = web::WebRequest();
+            request.timeout(std::chrono::seconds(20));
+            request.followRedirects(true);
+            request.param("country", country);
+            request.param("city", city);
+            request.param("method", method);
+            request.param("year", year);
+            request.param("month", month);
+
+            auto response = request.getSync("https://api.aladhan.com/v1/calendarByCity");
+            if (!response.ok()) return std::nullopt;
+
+            auto jsonRes = response.json();
+            if (!jsonRes) return std::nullopt;
+            auto json = jsonRes.unwrap();
+
+            auto dataRes = json["data"].asArray();
+            if (!dataRes) return std::nullopt;
+
+            std::unordered_map<std::string, DayTimes> out;
+            for (auto const& dayEntry : dataRes.unwrap()) {
+                auto gregDate = dayEntry["date"]["gregorian"]["date"].asString().unwrapOr("");
+                auto dateKey = gregorian_to_date_key(gregDate);
+                if (!dateKey) continue;
+
+                DayTimes parsed;
+                auto timings = dayEntry["timings"];
+                for (auto const* prayerName : kPrayerNames) {
+                    auto prayerText = timings[prayerName].asString().unwrapOr("");
+                    auto minute = parseMinuteOfDay(prayerText);
+                    if (!minute) continue;
+                    parsed[prayerName] = *minute;
+                }
+                if (!parsed.empty()) out[*dateKey] = std::move(parsed);
+            }
+
+            if (out.empty()) return std::nullopt;
+            return out;
+        }
+
         void tick(float) {
             auto date = get_now_time_string();
             auto nowTs = std::time(nullptr);
 
-            if (date != lastDate && !is_fetching) {
+            if (date != lastDate) {
+                lastDate = date;
                 done_notifs.clear();
+                this->load_today_from_cache();
+            }
+
+            if (!this->have_months_for_now_and_next() && !is_fetching) {
                 this->fetchPrayerTimesAsync();
             }
 
-            if ((nowTs - last_time) > 1800 && !is_fetching) {
+            if ((nowTs - last_time) > 21600 && !is_fetching) {
                 this->fetchPrayerTimesAsync();
             }
 
@@ -172,6 +279,10 @@ namespace {
         // fetch shit from api
         void fetchPrayerTimesAsync() {
             if (is_fetching) return;
+            if (this->have_months_for_now_and_next()) {
+                this->load_today_from_cache();
+                return;
+            }
             is_fetching = true;
 
             auto country = Mod::get()->getSettingValue<std::string>("country");
@@ -179,52 +290,47 @@ namespace {
             constexpr int method = 18;
 
             std::thread([this, country = std::move(country), city = std::move(city), method]() {
-                auto request = web::WebRequest();
-                request.timeout(std::chrono::seconds(15));
-                request.followRedirects(true);
-                request.param("country", country);
-                request.param("city", city);
-                request.param("method", method);
-
-                auto response = request.getSync("https://api.aladhan.com/v1/timingsByCity");
-                if (!response.ok()) {
-                    log::warn("Athan fetch failed: HTTP {} ({})", response.code(), response.errorMessage());
-                    is_fetching = false;
-                    return;
+                auto [year, month] = this->local_year_month();
+                auto nextMonth = month + 1;
+                auto nextYear = year;
+                if (nextMonth > 12) {
+                    nextMonth = 1;
+                    nextYear++;
                 }
 
-                auto jsonRes = response.json();
-                if (!jsonRes) {
-                    log::warn("Athan fetch JSON parse failed");
-                    is_fetching = false;
-                    return;
-                }
+                auto thisMonth = fetch_month_calendar(country, city, method, year, month);
+                auto nextMonthData = fetch_month_calendar(country, city, method, nextYear, nextMonth);
+                auto thisMonthKey = month_key_for(year, month);
+                auto nextMonthKey = month_key_for(nextYear, nextMonth);
 
-                auto json = jsonRes.unwrap();
-                auto timings = json["data"]["timings"];
-                std::unordered_map<std::string, int> parsed;
+                queueInMainThread([this, thisMonth = std::move(thisMonth), nextMonthData = std::move(nextMonthData), thisMonthKey, nextMonthKey]() mutable {
+                    if (thisMonth) {
+                        for (auto& [dayKey, dayTimes] : *thisMonth) {
+                            daily_cache[dayKey] = std::move(dayTimes);
+                        }
+                        month_cache_keys.insert(thisMonthKey);
+                    }
+                    if (nextMonthData) {
+                        for (auto& [dayKey, dayTimes] : *nextMonthData) {
+                            daily_cache[dayKey] = std::move(dayTimes);
+                        }
+                        month_cache_keys.insert(nextMonthKey);
+                        showed_next_month_warning = false;
+                    }
+                    else if (!showed_next_month_warning) {
+                        showed_next_month_warning = true;
+                        Notification::create("Please be online so prayer times work", NotificationIcon::Info, 3.f)->show();
+                    }
 
-                for (auto const* prayerName : kPrayerNames) {
-                    auto prayerText = timings[prayerName].asString().unwrapOr("");
-                    auto minute = parseMinuteOfDay(prayerText);
-                    if (!minute) continue;
-                    parsed[prayerName] = *minute;
-                }
-
-                if (parsed.empty()) {
-                    log::warn("Athan fetch succeeded but no prayer times were parsed");
-                    is_fetching = false;
-                    return;
-                }
-
-                queueInMainThread([this, parsed = std::move(parsed)]() mutable {
-                    pray_times = std::move(parsed);
+                    this->load_today_from_cache();
                     last_time = std::time(nullptr);
                     lastDate = get_now_time_string();
                     done_notifs.clear();
                     is_fetching = false;
 
-                    Notification::create("Athan times updated", NotificationIcon::Info, 1.5f)->show();
+                    if (thisMonth) {
+                        Notification::create("Athan month updated", NotificationIcon::Info, 1.5f)->show();
+                    }
                 });
             }).detach();
         }
@@ -344,6 +450,50 @@ namespace {
             return fmt::format("Next Salah: {} - at {}", nextPrayer->first, format_time(nextPrayer->second));
         }
 
+        std::string todayPrayerTimesAlertText() const {
+            auto nowTs = std::time(nullptr);
+            std::tm localTm {};
+#ifdef GEODE_IS_WINDOWS
+            localtime_s(&localTm, &nowTs);
+#else
+            localtime_r(&nowTs, &localTm);
+#endif
+
+            auto getPrayerText = [this](char const* prayer) {
+                auto it = pray_times.find(prayer);
+                if (it == pray_times.end()) return std::string("...");
+                auto minute = it->second;
+                auto hour = minute / 60;
+                auto min = minute % 60;
+                return fmt::format("{}:{:02d}", hour, min);
+            };
+
+            return fmt::format(
+                "PRAYER TIMES OF {} {} {}\n"
+                "Fajr: {}\n"
+                "Dhuhr: {}\n"
+                "Asr: {}\n"
+                "Maghrib: {}\n"
+                "Isha: {}",
+                localTm.tm_mday,
+                month_name_upper(localTm.tm_mon + 1),
+                localTm.tm_year + 1900,
+                getPrayerText("Fajr"),
+                getPrayerText("Dhuhr"),
+                getPrayerText("Asr"),
+                getPrayerText("Maghrib"),
+                getPrayerText("Isha")
+            );
+        }
+
+        void showTodayPrayerTimesPopup() {
+            FLAlertLayer::create(
+                "Prayer Times",
+                this->todayPrayerTimesAlertText(),
+                "OK"
+            )->show();
+        }
+
         void dismissNextPrayerAlertForSession() {
             if (pray_times.empty()) {
                 Notification::create("Prayer times not ready yet", NotificationIcon::Info, 2.f)->show();
@@ -408,11 +558,8 @@ $on_mod(Loaded) {
     ButtonSettingPressedEventV3(Mod::get(), "debug-actions").listen([](std::string_view buttonKey) {
         if (!g_runtime) return;
 
-        if (buttonKey == "test-notification") {
+        if (buttonKey == "run-test") {
             g_runtime->showTestNotification();
-            return;
-        }
-        if (buttonKey == "simulate-prayer-now") {
             g_runtime->simulatePrayerNow();
             return;
         }
@@ -427,9 +574,32 @@ $on_mod(Loaded) {
 }
 
 class $modify(AthanMenuLayerHook, MenuLayer) {
+    void onTimesPopup(CCObject*) {
+        if (!g_runtime) return;
+        g_runtime->showTodayPrayerTimesPopup();
+    }
+
     bool init() {
         if (!MenuLayer::init()) return false;
         ensureRuntimeAttached(this);
+
+        if (auto bottomMenu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("bottom-menu"))) {
+            auto buttonSprite = CCSprite::create("button2.png"_spr);
+            if (!buttonSprite) {
+                buttonSprite = CCSprite::createWithSpriteFrameName("GJ_infoIcon_001.png");
+            }
+            if (buttonSprite) {
+                buttonSprite->setScale(0.58f);
+                auto prayerTimesButton = CCMenuItemSpriteExtra::create(
+                    buttonSprite,
+                    this,
+                    menu_selector(AthanMenuLayerHook::onTimesPopup)
+                );
+                prayerTimesButton->setID("prayer-times-button");
+                bottomMenu->addChild(prayerTimesButton);
+                bottomMenu->updateLayout();
+            }
+        }
         return true;
     }
 };
