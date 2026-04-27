@@ -106,7 +106,7 @@ class AthanRuntime : public CCNode {
         auto arr = matjson::Value::array();
         for (auto& k : m_months) arr.push(k);
         j["month_cache_keys"] = arr;
-        file::writeString(Mod::get()->getSaveDir() / "athan_cache.json", j.dump());
+        (void)file::writeString(Mod::get()->getSaveDir() / "athan_cache.json", j.dump());
     }
 
     void loadCache() {
@@ -457,10 +457,15 @@ $on_mod(Loaded) {
         if (btn == "run-test" && g_runtime) g_runtime->testNotification();
     }).leak();
 
-    auto refetch = [](auto) { if (g_runtime) { g_runtime->fetchAsync(); } };
-    listenForSettingChanges<std::string_view>("country",            refetch)->leak();
-    listenForSettingChanges<std::string_view>("city",               refetch)->leak();
-    listenForSettingChanges<int64_t>("calculation-method",          refetch)->leak();
+    listenForSettingChanges<std::string_view>("country", [](std::string_view) {
+        if (g_runtime) g_runtime->fetchAsync();
+    })->leak();
+    listenForSettingChanges<std::string_view>("city", [](std::string_view) {
+        if (g_runtime) g_runtime->fetchAsync();
+    })->leak();
+    listenForSettingChanges<int64_t>("calculation-method", [](int64_t) {
+        if (g_runtime) g_runtime->fetchAsync();
+    })->leak();
 }
 
 // ── layer hooks ────────────────────────────────────────────────────────────
