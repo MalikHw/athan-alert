@@ -19,7 +19,7 @@
 using namespace geode::prelude;
 namespace web = geode::utils::web;
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// helpers
 
 static std::tm localNow() {
     auto ts = std::time(nullptr);
@@ -74,25 +74,25 @@ static const char* monthUpper(int m) {
 
 static auto& getSetting() { return *Mod::get(); }
 
-// ── runtime ────────────────────────────────────────────────────────────────
+// runtime
 
 static constexpr const char* kPrayers[5] = {"Fajr","Dhuhr","Asr","Maghrib","Isha"};
 
-using DayMap  = std::unordered_map<std::string,int>;       // prayer -> minuteOfDay
-using CacheMap= std::unordered_map<std::string,DayMap>;    // dateKey -> DayMap
+using DayMap  = std::unordered_map<std::string,int>; // prayer -> minuteOfDay
+using CacheMap= std::unordered_map<std::string,DayMap>; // dateKey -> DayMap
 
 class AthanRuntime : public CCNode {
     CacheMap            m_cache;
-    std::unordered_set<std::string> m_months;   // which year-month we have
+    std::unordered_set<std::string> m_months; // which year-month we have
     DayMap              m_today;
-    std::unordered_set<std::string> m_fired;    // "date-prayer[-pre]" already shown
+    std::unordered_set<std::string> m_fired; // "date-prayer[-pre]" already shown
     bool                m_fetching  = false;
     bool                m_geoFetch  = false;
     bool                m_skipNext  = false;
     std::time_t         m_lastFetch = 0;
     std::string         m_lastDate;
 
-    // ── cache persistence ──────────────────────────────────────────────────
+    // cache persistence
 
     void saveCache() {
         auto j = matjson::Value::object();
@@ -133,7 +133,7 @@ class AthanRuntime : public CCNode {
         } catch (...) {}
     }
 
-    // ── init / tick ────────────────────────────────────────────────────────
+    //init / tick
 
     bool init() override {
         if (!CCNode::init()) return false;
@@ -220,7 +220,7 @@ public:
         return nullptr;
     }
 
-    // ── fetch ──────────────────────────────────────────────────────────────
+    // fetch
 
     static std::optional<CacheMap> fetchMonth(
         std::string const& country, std::string const& city, int method, int y, int m
@@ -299,7 +299,7 @@ public:
         }).detach();
     }
 
-    // ── geo-ip ─────────────────────────────────────────────────────────────
+    // geo-ip
 
     void detectGeoIpAsync() {
         if (m_geoFetch) return;
@@ -307,12 +307,12 @@ public:
         std::thread([this]() {
             auto req = web::WebRequest();
             req.timeout(std::chrono::seconds(10)).followRedirects(true);
-            auto res = req.getSync("http://ip-api.com/json");
+            auto res = req.getSync("https://ip-api.com/json");
 
             if (!res.ok()) {
                 queueInMainThread([this, code = res.code()]() {
                     m_geoFetch = false;
-                    Notification::create(fmt::format("GeoIP failed (HTTP {})", code), NotificationIcon::Error, 2.f)->show();
+                    Notification::create(fmt::format("GeoIP failed (HTTPS {})", code), NotificationIcon::Error, 2.f)->show();
                 });
                 return;
             }
@@ -347,7 +347,7 @@ public:
         }).detach();
     }
 
-    // ── audio ──────────────────────────────────────────────────────────────
+    // audio
 
     void playAdhan() {
         if (!getSetting().getSettingValue<bool>("enable-adhan-audio")) return;
@@ -367,11 +367,11 @@ public:
         FMODAudioEngine::sharedEngine()->playEffect(path.string(), 1.f, 0.f, vol);
     }
 
-    // ── misc public ────────────────────────────────────────────────────────
+    // misc public
 
     void testNotification() {
         Notification::create("Test: Athan notification works!", NotificationIcon::Info, 2.5f)->show();
-        // simulate Fajr right now
+        // simulate Fajr right now since i cant test constantly ig
         auto cur = localNow();
         m_today["Fajr"] = cur.tm_hour * 60 + cur.tm_min;
         m_fired.erase(fmt::format("{}-Fajr", todayKey()));
@@ -429,7 +429,7 @@ public:
     }
 };
 
-// ── global singleton ───────────────────────────────────────────────────────
+// global singleton
 
 static AthanRuntime* g_runtime = nullptr;
 
@@ -446,7 +446,7 @@ static void ensureRuntime(CCNode* host) {
     }
 }
 
-// ── mod load ───────────────────────────────────────────────────────────────
+// mod load
 
 $on_mod(Loaded) {
     ButtonSettingPressedEventV3(Mod::get(), "geoip-actions").listen([](std::string_view btn) {
@@ -468,7 +468,7 @@ $on_mod(Loaded) {
     })->leak();
 }
 
-// ── layer hooks ────────────────────────────────────────────────────────────
+// layer hooks
 
 class $modify(AthanMenuLayer, MenuLayer) {
     void onTimesPopup(CCObject*) { if (g_runtime) g_runtime->showTimesPopup(); }
