@@ -99,6 +99,7 @@ namespace {
         std::time_t last_time = 0;
         std::string lastDate;
         bool skip_it = false;
+        
 
         static constexpr const char* kPrayerNames[5] = {
             "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"
