@@ -7,6 +7,7 @@
 #include <Geode/utils/web.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <filesystem>
@@ -105,10 +106,72 @@ namespace {
             "Fajr", "Dhuhr", "Asr", "Maghrib", "Isha"
         };
 
+        void save_cache_to_disk() {
+            auto path = Mod::get()->getSaveDir() / "athan_cache.json";
+            matjson::Value json = matjson::Object();
+            
+            matjson::Value daily = matjson::Object();
+            for (auto const& [date, times] : daily_cache) {
+                matjson::Value dayTimes = matjson::Object();
+                for (auto const& [prayer, minute] : times) {
+                    dayTimes[prayer] = minute;
+                }
+                daily[date] = dayTimes;
+            }
+            json["daily_cache"] = daily;
+
+            matjson::Value months = matjson::Array();
+            for (auto const& key : month_cache_keys) {
+                months.push_back(key);
+            }
+            json["month_cache_keys"] = months;
+
+            auto result = file::writeString(path, json.dump());
+            if (!result) {
+                log::warn("Failed to save athan cache: {}", result.unwrapErr());
+            }
+        }
+
+        void load_cache_from_disk() {
+            auto path = Mod::get()->getSaveDir() / "athan_cache.json";
+            if (!std::filesystem::exists(path)) return;
+
+            auto result = file::readString(path);
+            if (!result) return;
+
+            try {
+                auto json = matjson::parse(result.unwrap());
+                if (json.contains("daily_cache") && json["daily_cache"].isObject()) {
+                    for (auto const& [date, times] : json["daily_cache"].asObject().unwrap()) {
+                        DayTimes dayTimes;
+                        if (times.isObject()) {
+                            for (auto const& [prayer, minute] : times.asObject().unwrap()) {
+                                if (minute.isNumber()) {
+                                    dayTimes[prayer] = static_cast<int>(minute.asInt().unwrap());
+                                }
+                            }
+                        }
+                        daily_cache[date] = dayTimes;
+                    }
+                }
+                if (json.contains("month_cache_keys") && json["month_cache_keys"].isArray()) {
+                    for (auto const& key : json["month_cache_keys"].asArray().unwrap()) {
+                        if (key.isString()) {
+                            month_cache_keys.insert(key.asString().unwrap());
+                        }
+                    }
+                }
+                this->load_today_from_cache();
+            } catch (std::exception const& e) {
+                log::warn("Failed to parse athan cache: {}", e.what());
+            }
+        }
+
         // tick every 20s
         bool init() override {
             if (!CCNode::init()) return false;
 
+            this->load_cache_from_disk();
             this->schedule(schedule_selector(AthanRuntime::tick), 20.f);
             this->fetchPrayerTimesAsync();
             return true;
@@ -288,7 +351,7 @@ namespace {
 
             auto country = Mod::get()->getSettingValue<std::string>("country");
             auto city = Mod::get()->getSettingValue<std::string>("city");
-            constexpr int method = 18;
+            auto method = std::clamp(static_cast<int>(Mod::get()->getSettingValue<int>("calculation-method")), 1, 22);
 
             std::thread([this, country = std::move(country), city = std::move(city), method]() {
                 auto [year, month] = this->local_year_month();
@@ -330,6 +393,7 @@ namespace {
                     is_fetching = false;
 
                     if (thisMonth) {
+                        this->save_cache_to_disk();
                         Notification::create("Athan month updated", NotificationIcon::Info, 1.5f)->show();
                     }
                 });
@@ -514,6 +578,7 @@ namespace {
 
         // plays the adhan sound
         void playConfiguredAdhan() {
+            if (!Mod::get()->getSettingValue<bool>("enable-adhan-audio")) return;
             auto selected = Mod::get()->getSettingValue<std::filesystem::path>("adhan-mp3");
             std::filesystem::path audioPath;
 
@@ -529,7 +594,13 @@ namespace {
                 return;
             }
 
-            FMODAudioEngine::sharedEngine()->playEffect(audioPath.string());
+            auto volume = static_cast<float>(Mod::get()->getSettingValue<double>("adhan-volume"));
+            auto engine = FMODAudioEngine::sharedEngine();
+            
+            // FMODAudioEngine doesn't have a direct per-effect volume param in playEffect
+            // but we can scale the volume via the engine's SFX volume temporarily or use the engine's internal methods if accessible.
+            // Since we want to be safe and minimal, we'll use the most common pattern in GD modding for volume scaling.
+            engine->playEffect(audioPath.string(), 1.0f, 0.0f, volume);
         }
     };
 
@@ -571,6 +642,11 @@ $on_mod(Loaded) {
     })->leak();
     listenForSettingChanges<std::string_view>("city", [](std::string_view) {
         if (g_runtime) g_runtime->fetchPrayerTimesAsync();
+    })->leak();
+    listenForSettingChanges<int64_t>("calculation-method", [](int64_t) {
+        if (g_runtime) {
+            g_runtime->fetchPrayerTimesAsync();
+        }
     })->leak();
 }
 
@@ -619,6 +695,13 @@ class $modify(AthanPauseLayerHook, PauseLayer) {
         g_runtime->dismissNextPrayerAlertForSession();
     }
 
+    void updateNextSalahLabel(float) {
+        if (!g_runtime) return;
+        if (auto label = typeinfo_cast<CCLabelBMFont*>(this->getChildByID("next-salah-label"))) {
+            label->setString(g_runtime->nextPrayerText().c_str());
+        }
+    }
+
     void customSetup() {
         PauseLayer::customSetup();
         if (!g_runtime) return;
@@ -651,6 +734,8 @@ class $modify(AthanPauseLayerHook, PauseLayer) {
                 nextText->setPosition({playButton->getPositionX(), playButton->getPositionY() - 32.f});
                 nextText->setID("next-salah-label");
                 this->addChild(nextText);
+                
+                this->schedule(schedule_selector(AthanPauseLayerHook::updateNextSalahLabel), 1.0f);
             }
         }
     }

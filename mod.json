@@ -33,11 +33,33 @@
             "description": "City used when fetching prayer times from Aladhan API.",
             "default": "London"
         },
+        "calculation-method": {
+            "type": "int",
+            "name": "Calculation Method",
+            "description": "Calculation method for prayer times (1-22). Default is 18.",
+            "default": 18,
+            "min": 1,
+            "max": 22
+        },
         "auto-pause-on-prayer": {
             "type": "bool",
             "name": "Auto Pause On Prayer",
             "description": "Automatically pause the level when prayer time starts.",
             "default": false
+        },
+        "enable-adhan-audio": {
+            "type": "bool",
+            "name": "Enable Adhan Audio",
+            "description": "Play the adhan sound when it's prayer time.",
+            "default": true
+        },
+        "adhan-volume": {
+            "type": "float",
+            "name": "Adhan Volume",
+            "description": "Volume of the adhan sound.",
+            "default": 1.0,
+            "min": 0.0,
+            "max": 1.0
         },
         "remind-one-minute-before": {
             "type": "bool",
