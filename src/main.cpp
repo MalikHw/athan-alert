@@ -108,11 +108,11 @@ namespace {
 
         void save_cache_to_disk() {
             auto path = Mod::get()->getSaveDir() / "athan_cache.json";
-            matjson::Value json = matjson::Object();
+            auto json = matjson::Value::object();
             
-            matjson::Value daily = matjson::Object();
+            auto daily = matjson::Value::object();
             for (auto const& [date, times] : daily_cache) {
-                matjson::Value dayTimes = matjson::Object();
+                auto dayTimes = matjson::Value::object();
                 for (auto const& [prayer, minute] : times) {
                     dayTimes[prayer] = minute;
                 }
@@ -120,9 +120,9 @@ namespace {
             }
             json["daily_cache"] = daily;
 
-            matjson::Value months = matjson::Array();
+            auto months = matjson::Value::array();
             for (auto const& key : month_cache_keys) {
-                months.push_back(key);
+                months.push(key);
             }
             json["month_cache_keys"] = months;
 
@@ -139,8 +139,14 @@ namespace {
             auto result = file::readString(path);
             if (!result) return;
 
+            auto parseResult = matjson::parse(result.unwrap());
+            if (!parseResult) {
+                log::warn("Failed to parse athan cache: {}", parseResult.unwrapErr());
+                return;
+            }
+            auto json = parseResult.unwrap();
+
             try {
-                auto json = matjson::parse(result.unwrap());
                 if (json.contains("daily_cache") && json["daily_cache"].isObject()) {
                     for (auto const& [date, times] : json["daily_cache"].asObject().unwrap()) {
                         DayTimes dayTimes;
@@ -163,7 +169,7 @@ namespace {
                 }
                 this->load_today_from_cache();
             } catch (std::exception const& e) {
-                log::warn("Failed to parse athan cache: {}", e.what());
+                log::warn("Failed to process athan cache: {}", e.what());
             }
         }
 
