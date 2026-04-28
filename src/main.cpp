@@ -349,7 +349,7 @@ public:
                 getSetting().setSettingValue<std::string>("city", city);
                 Notification::create(fmt::format("Location: {}, {}", city, country), NotificationIcon::Success, 2.f)->show();
                 // clear cache so we refetch with the new city from scratch
-                if (g_runtime) g_runtime->clearCacheAndRefetch();
+                this->clearCacheAndRefetch();
             });
         }).detach();
     }
