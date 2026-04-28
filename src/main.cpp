@@ -78,21 +78,19 @@ static auto& getSetting() { return *Mod::get(); }
 
 static constexpr const char* kPrayers[5] = {"Fajr","Dhuhr","Asr","Maghrib","Isha"};
 
-using DayMap  = std::unordered_map<std::string,int>; // prayer -> minuteOfDay
-using CacheMap= std::unordered_map<std::string,DayMap>; // dateKey -> DayMap
+using DayMap  = std::unordered_map<std::string,int>;
+using CacheMap= std::unordered_map<std::string,DayMap>;
 
 class AthanRuntime : public CCNode {
     CacheMap            m_cache;
-    std::unordered_set<std::string> m_months; // which year-month we have
+    std::unordered_set<std::string> m_months;
     DayMap              m_today;
-    std::unordered_set<std::string> m_fired; // "date-prayer[-pre]" already shown
+    std::unordered_set<std::string> m_fired;
     bool                m_fetching  = false;
     bool                m_geoFetch  = false;
     bool                m_skipNext  = false;
     std::time_t         m_lastFetch = 0;
     std::string         m_lastDate;
-
-    // cache persistence
 
     void saveCache() {
         auto j = matjson::Value::object();
@@ -133,12 +131,19 @@ class AthanRuntime : public CCNode {
         } catch (...) {}
     }
 
-    //init / tick
-
     bool init() override {
         if (!CCNode::init()) return false;
         loadCache();
-        this->schedule(schedule_selector(AthanRuntime::tick), 20.f);
+
+        // FIX: Schedule directly on the global CCScheduler instead of using this->schedule().
+        // this->schedule() ties the selector to the node's onEnter/onExit lifecycle.
+        // On Android, re-parenting this node between scenes causes onExit to fire, which
+        // unregisters the scheduler target — tick() stops silently and permanently.
+        // Scheduling on CCDirector's scheduler directly bypasses the lifecycle entirely.
+        CCDirector::sharedDirector()->getScheduler()->scheduleSelector(
+            schedule_selector(AthanRuntime::tick), this, 20.f, false
+        );
+
         fetchAsync();
         return true;
     }
@@ -171,7 +176,6 @@ class AthanRuntime : public CCNode {
             refreshToday();
         }
 
-        // re-fetch every 6 hours or if we're missing months
         if (!m_fetching && (!haveBothMonths() || (now - m_lastFetch) > 21600))
             fetchAsync();
 
@@ -185,7 +189,6 @@ class AthanRuntime : public CCNode {
             if (it == m_today.end()) continue;
             int pmin = it->second;
 
-            // 1-min reminder
             if (getSetting().getSettingValue<bool>("remind-one-minute-before") && pmin - 1 == cur) {
                 auto key = fmt::format("{}-{}-pre", date, name);
                 if (m_fired.insert(key).second)
@@ -195,7 +198,7 @@ class AthanRuntime : public CCNode {
             if (pmin != cur) continue;
 
             auto key = fmt::format("{}-{}", date, name);
-            if (!m_fired.insert(key).second) continue;  // already fired
+            if (!m_fired.insert(key).second) continue;
 
             if (m_skipNext) {
                 m_skipNext = false;
@@ -203,12 +206,17 @@ class AthanRuntime : public CCNode {
                 continue;
             }
 
-            // show notification + play audio
             Notification::create(fmt::format("It's {} prayer time!", name), NotificationIcon::Info, 3.f)->show();
             playAdhan();
 
-            if (getSetting().getSettingValue<bool>("auto-pause-on-prayer") && PlayLayer::get())
-                CCDirector::sharedDirector()->pause();
+            // FIX: CCDirector::pause() pauses ALL CCScheduler targets, including our tick().
+            // If auto-pause ever fired, tick() would stop permanently until a scene change.
+            // Use PlayLayer::pauseGame() instead — it only pauses the game, not the scheduler.
+            if (getSetting().getSettingValue<bool>("auto-pause-on-prayer")) {
+                if (auto* pl = PlayLayer::get()) {
+                    pl->pauseGame();
+                }
+            }
         }
     }
 
@@ -219,8 +227,6 @@ public:
         CC_SAFE_DELETE(r);
         return nullptr;
     }
-
-    // fetch
 
     static std::optional<CacheMap> fetchMonth(
         std::string const& country, std::string const& city, int method, int y, int m
@@ -299,7 +305,9 @@ public:
         }).detach();
     }
 
-    // geo-ip
+    // FIX: ip-api.com returns HTTP 403 on HTTPS for free tier.
+    //      Switched to ipapi.co which supports HTTPS for free.
+    //      Field name is "country_name" (not "country"), and has an "error" bool on failure.
 
     void detectGeoIpAsync() {
         if (m_geoFetch) return;
@@ -307,12 +315,12 @@ public:
         std::thread([this]() {
             auto req = web::WebRequest();
             req.timeout(std::chrono::seconds(10)).followRedirects(true);
-            auto res = req.getSync("https://ip-api.com/json");
+            auto res = req.getSync("https://ipapi.co/json/");
 
             if (!res.ok()) {
                 queueInMainThread([this, code = res.code()]() {
                     m_geoFetch = false;
-                    Notification::create(fmt::format("GeoIP failed (HTTPS {})", code), NotificationIcon::Error, 2.f)->show();
+                    Notification::create(fmt::format("GeoIP failed ({})", code), NotificationIcon::Error, 2.f)->show();
                 });
                 return;
             }
@@ -326,36 +334,34 @@ public:
                 return;
             }
 
-            auto j       = jr.unwrap();
-            auto status  = j["status"].asString().unwrapOr("");
-            auto country = j["country"].asString().unwrapOr("");
-            auto city    = j["city"].asString().unwrapOr("");
+            auto j        = jr.unwrap();
+            auto country  = j["country_name"].asString().unwrapOr("");
+            auto city     = j["city"].asString().unwrapOr("");
+            bool hasError = j.contains("error") && j["error"].asBool().unwrapOr(false);
 
-            queueInMainThread([this, status, country, city]() {
+            queueInMainThread([this, hasError, country, city]() {
                 m_geoFetch = false;
-                if (status != "success" || country.empty() || city.empty()) {
+                if (hasError || country.empty() || city.empty()) {
                     Notification::create("GeoIP couldn't find your location", NotificationIcon::Error, 2.f)->show();
                     return;
                 }
                 getSetting().setSettingValue<std::string>("country", country);
                 getSetting().setSettingValue<std::string>("city", city);
                 Notification::create(fmt::format("Location: {}, {}", city, country), NotificationIcon::Success, 2.f)->show();
-                // invalidate months so we re-fetch with new city
                 m_months.clear();
                 fetchAsync();
             });
         }).detach();
     }
 
-    // audio
+    // FIX: On Android, gd::string != std::string. playEffect silently no-ops if you pass
+    //      a std::string. Construct a gd::string explicitly, and use u8string() for the path.
 
     void playAdhan() {
         if (!getSetting().getSettingValue<bool>("enable-adhan-audio")) return;
 
         auto selected = getSetting().getSettingValue<std::filesystem::path>("adhan-mp3");
         auto defPath  = Mod::get()->getResourcesDir() / "default-adhan.mp3";
-
-        // FIX: use default if selected is empty OR doesn't exist on disk
         auto path = (selected.empty() || !std::filesystem::exists(selected)) ? defPath : selected;
 
         if (!std::filesystem::exists(path)) {
@@ -364,14 +370,12 @@ public:
         }
 
         auto vol = (float)getSetting().getSettingValue<double>("adhan-volume");
-        FMODAudioEngine::sharedEngine()->playEffect(path.string(), 1.f, 0.f, vol);
+        gd::string gdPath = path.u8string();
+        FMODAudioEngine::sharedEngine()->playEffect(gdPath, 1.f, 0.f, vol);
     }
-
-    // misc public
 
     void testNotification() {
         Notification::create("Test: Athan notification works!", NotificationIcon::Info, 2.5f)->show();
-        // simulate Fajr right now since i cant test constantly ig
         auto cur = localNow();
         m_today["Fajr"] = cur.tm_hour * 60 + cur.tm_min;
         m_fired.erase(fmt::format("{}-Fajr", todayKey()));
@@ -393,13 +397,11 @@ public:
         if (m_today.empty()) return std::nullopt;
         auto t   = localNow();
         int  cur = t.tm_hour * 60 + t.tm_min;
-        // first prayer at or after current minute
         for (auto* p : kPrayers) {
             auto it = m_today.find(p);
             if (it != m_today.end() && it->second >= cur)
                 return std::make_pair(std::string(p), it->second);
         }
-        // wrap around to first prayer tomorrow
         for (auto* p : kPrayers) {
             auto it = m_today.find(p);
             if (it != m_today.end())
@@ -430,23 +432,23 @@ public:
 };
 
 // global singleton
+// FIX: Removed re-parenting entirely. The old ensureRuntime(CCNode* host) moved g_runtime
+//      between layers on every scene change. On Android this fires onExit on the node,
+//      which calls pauseSchedulerAndActions() internally, killing tick() permanently.
+//      Now we create the runtime once, retain it, and add it to the first available scene.
+//      The scheduler registration in init() goes directly to CCDirector's global scheduler
+//      so scene transitions cannot unregister it.
 
 static AthanRuntime* g_runtime = nullptr;
 
-static void ensureRuntime(CCNode* host) {
-    if (!host) return;
-    if (!g_runtime) {
-        g_runtime = AthanRuntime::create();
-        if (!g_runtime) return;
-        g_runtime->retain();
-    }
-    if (g_runtime->getParent() != host) {
-        g_runtime->removeFromParentAndCleanup(false);
-        host->addChild(g_runtime);
-    }
+static void ensureRuntime() {
+    if (g_runtime) return;
+    g_runtime = AthanRuntime::create();
+    if (!g_runtime) return;
+    g_runtime->retain();
+    if (auto* scene = CCDirector::sharedDirector()->getRunningScene())
+        scene->addChild(g_runtime);
 }
-
-// mod load
 
 $on_mod(Loaded) {
     ButtonSettingPressedEventV3(Mod::get(), "geoip-actions").listen([](std::string_view btn) {
@@ -468,14 +470,12 @@ $on_mod(Loaded) {
     })->leak();
 }
 
-// layer hooks
-
 class $modify(AthanMenuLayer, MenuLayer) {
     void onTimesPopup(CCObject*) { if (g_runtime) g_runtime->showTimesPopup(); }
 
     bool init() {
         if (!MenuLayer::init()) return false;
-        ensureRuntime(this);
+        ensureRuntime();
 
         if (auto* menu = typeinfo_cast<CCMenu*>(this->getChildByIDRecursive("bottom-menu"))) {
             auto* spr = CCSprite::create("button2.png"_spr);
@@ -495,7 +495,7 @@ class $modify(AthanMenuLayer, MenuLayer) {
 class $modify(AthanPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        ensureRuntime(this);
+        ensureRuntime();
         return true;
     }
 };
