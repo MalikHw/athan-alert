@@ -17,7 +17,7 @@
         "community": "https://discord.gg/G9bZ92eg2n"
     },
     "resources": {
-        "files": ["resources/default-adhan.mp3"],
+        "files": ["resources/adhan-default.mp3"],
         "sprites": ["resources/button.png", "resources/button2.png"]
     },
     "settings": {
