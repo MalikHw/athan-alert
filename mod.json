@@ -85,9 +85,17 @@
         "geoip-actions": {
             "type": "button",
             "name": "Location Detection",
-            "description": "Detect location by GeoIP and auto-fill Country/City.",
+            "description": "Detect location by GeoIP and auto-fill Country/City. Also clears and re-downloads prayer times for the new location.",
             "buttons": {
                 "detect-location": "Detect Country/City via GeoIP"
+            }
+        },
+        "refetch-actions": {
+            "type": "button",
+            "name": "Prayer Times Cache",
+            "description": "Manually clear the cached prayer times and re-download fresh data from Aladhan.",
+            "buttons": {
+                "refetch-times": "Clear Cache & Refetch"
             }
         },
         "debug-actions": {
