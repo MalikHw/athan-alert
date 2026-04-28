@@ -71,7 +71,7 @@
             "type": "file",
             "name": "Adhan MP3",
             "description": "MP3 played on prayer alert. Leave as default to use bundled adhan.",
-            "default": "{mod_resources_dir}/default-adhan.mp3",
+            "default": "{mod_resources_dir}/adhan-default.mp3",
             "control": {
                 "dialog": "open",
                 "filters": [
