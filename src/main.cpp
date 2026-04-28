@@ -214,7 +214,7 @@ class AthanRuntime : public CCNode {
             // Use PlayLayer::pauseGame() instead — it only pauses the game, not the scheduler.
             if (getSetting().getSettingValue<bool>("auto-pause-on-prayer")) {
                 if (auto* pl = PlayLayer::get()) {
-                    pl->pauseGame();
+                    pl->pauseGame(false);
                 }
             }
         }
@@ -348,8 +348,8 @@ public:
                 getSetting().setSettingValue<std::string>("country", country);
                 getSetting().setSettingValue<std::string>("city", city);
                 Notification::create(fmt::format("Location: {}, {}", city, country), NotificationIcon::Success, 2.f)->show();
-                m_months.clear();
-                fetchAsync();
+                // clear cache so we refetch with the new city from scratch
+                if (g_runtime) g_runtime->clearCacheAndRefetch();
             });
         }).detach();
     }
@@ -370,7 +370,7 @@ public:
         }
 
         auto vol = (float)getSetting().getSettingValue<double>("adhan-volume");
-        gd::string gdPath = path.u8string();
+        gd::string gdPath = path.string();
         FMODAudioEngine::sharedEngine()->playEffect(gdPath, 1.f, 0.f, vol);
     }
 
@@ -381,6 +381,19 @@ public:
         m_fired.erase(fmt::format("{}-Fajr", todayKey()));
         Notification::create("Simulating Fajr now", NotificationIcon::Info, 2.f)->show();
         tick(0.f);
+    }
+
+    void clearCacheAndRefetch() {
+        m_cache.clear();
+        m_months.clear();
+        m_today.clear();
+        m_fired.clear();
+        m_lastFetch = 0;
+        auto cachePath = Mod::get()->getSaveDir() / "athan_cache.json";
+        if (std::filesystem::exists(cachePath))
+            std::filesystem::remove(cachePath);
+        Notification::create("Cache cleared, refetching...", NotificationIcon::Info, 2.f)->show();
+        fetchAsync();
     }
 
     void skipNextAlert() {
@@ -457,6 +470,10 @@ $on_mod(Loaded) {
 
     ButtonSettingPressedEventV3(Mod::get(), "debug-actions").listen([](std::string_view btn) {
         if (btn == "run-test" && g_runtime) g_runtime->testNotification();
+    }).leak();
+
+    ButtonSettingPressedEventV3(Mod::get(), "refetch-actions").listen([](std::string_view btn) {
+        if (btn == "refetch-times" && g_runtime) g_runtime->clearCacheAndRefetch();
     }).leak();
 
     listenForSettingChanges<std::string_view>("country", [](std::string_view) {
